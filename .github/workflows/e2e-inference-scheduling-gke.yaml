@@ -204,3 +204,16 @@ jobs:
           cd guides/inference-scheduling
           helmfile destroy -e ${{ matrix.accelerator.helmfile_env }}
           kubectl delete -f httproute.gke.yaml
+
+      - name: Send Google Chat notification on failure
+        if: failure()
+        uses: Co-qn/google-chat-notification@3691ccf4763537d6e544bc6cdcccc1965799d056
+        with:
+          webhook_url: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          title: 'CI Test Failed: ${{ github.repository }}'
+          # The message now includes the workflow name and the specific job name
+          message: 'The **${{ github.workflow }} - {{ matrix.accelerator.name }}** workflow failed.'
+          status: failure
+          display_button: true
+          button_text: 'View Workflow Run'
+          button_url: 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
