@@ -213,5 +213,5 @@ jobs:
         uses: Co-qn/google-chat-notification@3691ccf4763537d6e544bc6cdcccc1965799d056
         with:
           url: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
-          name: '{{ github.workflow }} - {{ matrix.accelerator.name }}'
+          name: '${{ github.workflow }} - ${{ matrix.accelerator.name }}'
           status: ${{ job.status }}
