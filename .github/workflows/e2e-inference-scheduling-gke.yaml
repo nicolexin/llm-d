@@ -213,7 +213,7 @@ jobs:
         uses: Co-qn/google-chat-notification@3691ccf4763537d6e544bc6cdcccc1965799d056
         with:
           webhook_url: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
-          title: 'CI Test Failed: ${{ github.repository }}'
+          name: 'E2E Test Failed: ${{ github.repository }}'
           # The message now includes the workflow name and the specific job name
           message: 'The **${{ github.workflow }} - {{ matrix.accelerator.name }}** workflow failed.'
           status: failure
