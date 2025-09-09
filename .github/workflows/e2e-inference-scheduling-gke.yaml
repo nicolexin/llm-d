@@ -201,13 +201,6 @@ jobs:
           name: llmd-pod-logs-inference-scheduling-${{ matrix.accelerator.name }}
           path: pod-logs-inference-scheduling
 
-      - name: Cleanup deployment
-        if: always()
-        run: |
-          cd guides/inference-scheduling
-          helmfile destroy -e ${{ matrix.accelerator.helmfile_env }}
-          kubectl delete -f httproute.gke.yaml
-
       - name: Send Google Chat notification on failure
         if: failure()
         uses: Co-qn/google-chat-notification@3691ccf4763537d6e544bc6cdcccc1965799d056
@@ -215,3 +208,10 @@ jobs:
           url: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
           name: '${{ github.workflow }} - ${{ matrix.accelerator.name }}'
           status: ${{ job.status }}
+
+      - name: Cleanup deployment
+        if: always()
+        run: |
+          cd guides/inference-scheduling
+          helmfile destroy -e ${{ matrix.accelerator.helmfile_env }}
+          kubectl delete -f httproute.gke.yaml
