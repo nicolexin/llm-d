@@ -200,11 +200,11 @@ jobs:
 
       - name: Send Google Chat notification on failure
         if: failure()
-        uses: Co-qn/google-chat-notification@3691ccf4763537d6e544bc6cdcccc1965799d056
+        uses: SimonScholz/google-chat-action@3b3519e5102dba8aa5046fd711c4b553586409bb
         with:
-          url: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
-          name: '${{ github.workflow }} - ${{ matrix.accelerator.name }}'
-          status: ${{ job.status }}
+          webhookUrl: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          jobStatus: ${{ job.status }}
+          title: '${{ github.workflow }} - ${{ matrix.accelerator.name }}'
 
       - name: Cleanup deployment
         if: always()
