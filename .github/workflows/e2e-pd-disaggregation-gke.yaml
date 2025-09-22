@@ -44,7 +44,7 @@ jobs:
       NAMESPACE: llm-d-pd
       GATEWAY: gke-l7-regional-external-managed
       GATEWAY_TYPE: gke
-      PR_OR_BRANCH: ${{ github.event.inputs.pr_or_branch || github.event.issue.number || github.event.number }}
+      PR_OR_BRANCH: ${{ github.event.inputs.pr_or_branch || github.event.issue.number || github.event.number || 'main' }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
@@ -159,7 +159,7 @@ jobs:
             --for=condition=Ready \
             --all \
             -n "${NAMESPACE}" \
-            --timeout=10m
+            --timeout=15m
           sleep 480 # Allow extra time for model loading in PD setup
           echo "✅ All pods are ready."
           kubectl get pods -n "${NAMESPACE}"
@@ -243,6 +243,14 @@ jobs:
         with:
           name: llmd-pod-logs-pd-disaggregation
           path: pod-logs-pd-disaggregation
+
+      - name: Send Google Chat notification on failure
+        if: failure()
+        uses: SimonScholz/google-chat-action@3b3519e5102dba8aa5046fd711c4b553586409bb
+        with:
+          webhookUrl: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          jobStatus: ${{ job.status }}
+          title: ${{ github.workflow }}
 
       - name: Cleanup deployment
         if: always()
