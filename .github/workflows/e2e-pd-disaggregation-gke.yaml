@@ -104,6 +104,10 @@ jobs:
           # Set Prefill to 1 GPU
           yq e '.prefill.replicas = 1' -i guides/pd-disaggregation/ms-pd/values.yaml
 
+          # Reduce model length to 3200
+          yq e '.decode.containers[].args |= ( (.. | select(. == "--max-model-len") | key) as $idx | .[$idx + 1] = "3200" )' -i guides/pd-disaggregation/ms-pd/values.yaml
+          yq e '.prefill.containers[].args |= ( (.. | select(. == "--max-model-len") | key) as $idx | .[$idx + 1] = "3200" )' -i guides/pd-disaggregation/ms-pd/values.yaml
+
           # Verify the slimmed down values
           echo "📋 Verifying transformation results..."
           echo "Replicas in ms-pd prefill:"
