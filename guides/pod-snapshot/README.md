@@ -1,14 +1,33 @@
-# Pod Snapshots
+# LLM Cold Start Optimization: GKE Image Streaming and Pod Snapshots
 
-Pod Snapshots allow you to capture a snapshot of a running Pod's memory state (including GPU memory), and restore future instances of the Pod from that snapshot. For model servers, this can drastically reduce container startup latency by bypassing the container image downloading, model weight downloading, and model server initialization phases, restoring directly into a ready state.
+Deploying large language models (LLMs) on Kubernetes often suffers from high cold-start latencies. For instance, launching a container to serve `meta-llama/Llama-3.1-8B-Instruct` can take **nearly 7 minutes** due to:
+1. **Network Transfer**: Pulling the massive container image (~9.6GB) over the network (~3.6 minutes).
+2. **Model Initialization**: Downloading model weights from HuggingFace, loading them into host memory, allocating GPU VRAM, and initializing the CUDA graph (~3.25 minutes).
 
-> [!NOTE]
-> Pod Snapshots are a GKE-exclusive feature and require the GKE Sandbox (gVisor) runtime.
+This guide demonstrates how to combine two powerful GKE-exclusive features—**GKE Image Streaming** and **GKE Pod Snapshots**—to eliminate both bottlenecks. Together, they reduce the total cold-start latency of a massive LLM container from **nearly 7 minutes to just 15 seconds (a ~96.3% latency reduction)**, making highly responsive auto-scaling and scale-to-zero architectures practical for production workloads.
+
+---
+
+## Startup Time Benchmark Analysis
+
+The table below showcases the real-world performance improvements achieved across multiple test runs by combining GKE Pod Snapshots and GKE Image Streaming:
+
+| Deployment Scenario | Image Pull Time | Model/Engine Initialization | Total Startup Time | Latency Reduction |
+| :--- | :---: | :---: | :---: | :---: |
+| **Standard Cold Start (Baseline)** | ~214s | ~195s | **~409s (6.8 mins)** | Baseline |
+| **Cold Start + GKE Image Streaming** | ~4s | ~195s | **~199s (3.3 mins)** | ~51.6% |
+| **Warm Start + Pod Snapshots (No Image Streaming)** | ~214s | ~11s | **~225s (3.8 mins)** | ~45% |
+| **Optimized Stack (Image Streaming + Pod Snapshots)** | **~4s** | **~11s** | **~15s (15 seconds)** | **~96.3%** |
+
+*Benchmarks are based on running `meta-llama/Llama-3.1-8B-Instruct` on a single NVIDIA L4 GPU.
+
+---
 
 ## Overview and Concepts
 
 For a detailed conceptual overview of how GKE Pod snapshots work, refer to the official [About GKE Pod snapshots](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/pod-snapshots) documentation.
 
+To learn more about how GKE Image Streaming functions under the hood, refer to the official [About GKE Image Streaming](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/image-streaming) documentation.
 
 ## Key Use Cases
 
@@ -16,10 +35,21 @@ For a detailed conceptual overview of how GKE Pod snapshots work, refer to the o
 2. **Scale from Zero**: Aggressively scale down to zero when idle and restore instantly upon request. See the [Workload Autoscaling guide](../workload-autoscaling) for configuring scale-to-zero in llm-d.
 3. **Spot VM Recovery**: Minimize disruption when [spot VMs](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/spot-vms) are preempted and replaced.
 
-
 ## Requirements and Limitations
 
-Before proceeding, review the official [GKE Pod Snapshots Requirements and Limitations](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/pod-snapshots#limitations) for up-to-date details on supported machine types and other requirements.
+Before proceeding, review the official [GKE Pod Snapshots Requirements and Limitations](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/pod-snapshots#limitations) and [GKE Image Streaming Requirements](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/image-streaming#requirements) for up-to-date details on supported machine types and other requirements.
+
+**Note:** The GKE Pod Snapshots feature has been only validated on single host deployments with NVIDIA L4 GPUs. Multi-host deployment is currently not tested.
+
+---
+
+## How this Guide Works
+
+To demonstrate the full lifecycle and performance benefits of these optimizations, this guide walks through the following workflow:
+1. **Environment Setup**: Set up the GKE cluster with GKE Pod Snapshots and GKE Image Streaming enabled.
+2. **Multi-Replica Deployment**: Initialize the model server deployment with at least two replicas, in this guide we use 2 replicas.
+3. **Snapshot Trigger**: Only one of the active replicas will trigger a system-level memory and GPU state snapshot. During the snapshot, the pod will be frozen. The other replica(s) remains fully operational to serve active traffic. This is the recommended deployment pattern to maintain high availability.
+4. **Scale-out Test**: Scale the deployment to three replicas to trigger a warm start (restoring directly from the newly created snapshot).
 
 ---
 
@@ -27,9 +57,10 @@ Before proceeding, review the official [GKE Pod Snapshots Requirements and Limit
 
 ### 1. Infrastructure Requirements
 
-To use Pod snapshots, you must have a GKE cluster with:
-*   Workload Identity enabled.
-*   Pod snapshots enabled.
+To run through this guide, you must have a GKE cluster with:
+*   [Workload Identity enabled](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-identity#enable_on_clusters_and_node_pools).
+*   [Image Streaming enabled](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/image-streaming#enable-streaming-clusters).
+*   [Pod snapshots enabled](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/pod-snapshots#enable).
 
 Additionally, the GKE Sandbox (gVisor) runtime must be enabled on your node pools. For Autopilot clusters, this is enabled automatically. For standard clusters, you must explicitly create a GPU node pool with GKE Sandbox enabled (using the `--sandbox=type=gvisor` flag).
 
@@ -77,6 +108,11 @@ Setting up GKE Pod Snapshots storage involves three main steps:
 
 ### 1. Create a GCS Bucket and Configure IAM Permissions
 You must create a Google Cloud Storage bucket with hierarchical namespace enabled and set up Workload Identity permissions so your Pods can read and write to the bucket. For complete, step-by-step instructions, follow the official GKE guide on [Store snapshots](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/pod-snapshots#store-snapshots).
+
+> [!IMPORTANT]
+> The Kubernetes ServiceAccount (KSA) name used by the model server deployment is dynamically generated by Kustomize using the `namePrefix` configured in `base/kustomization.yaml`.
+> - By default, the name of the service account is **`pod-snapshot-gpu-vllm-sa`**.
+> - You must grant this service account `roles/storage.objectUser` permissions on your GCS bucket using Workload Identity.
 
 ### 2. Deploy the PodSnapshotStorageConfig
 Create and deploy a `PodSnapshotStorageConfig` resource named `pod-snapshot-storage-config` pointing to your GCS bucket, following the official GKE guide on [Configuring snapshot storage](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/pod-snapshots#configure-storage).
@@ -189,17 +225,65 @@ Keep monitoring the `PodSnapshot` custom resource to check the status of the sna
 kubectl get podsnapshots -o yaml -n ${NAMESPACE}
 ```
 
----
+Once the snapshot is complete, the pod will resume and be ready to serve traffic.
 
-## Measuring Startup Performance
+## Verification
 
-Once the snapshot is successfully created, we can test scaling up the deployment to measure warm start latency.
+### 1. Get the IP of the Proxy
 
-### 1. Scale Up the Fleet
-Scale the deployment to 2 replicas:
+**Standalone Mode**
 
 ```bash
-kubectl scale deployment pod-snapshot-gpu-vllm-decode --replicas=2
+export IP=$(kubectl get service ${GUIDE_NAME}-epp -n ${NAMESPACE} -o jsonpath='{.spec.clusterIP}')
+```
+
+<details>
+<summary> <b>Gateway Mode</b> </summary>
+
+```bash
+export IP=$(kubectl get gateway llm-d-inference-gateway -n ${NAMESPACE} -o jsonpath='{.status.addresses[0].value}')
+```
+
+</details>
+
+### 2. Send Test Requests
+
+**Open a temporary interactive shell inside the cluster:**
+
+```bash
+kubectl run curl-debug --rm -it \
+    --image=cfmanteiga/alpine-bash-curl-jq \
+    --namespace="$NAMESPACE" \
+    --env="IP=$IP" \
+    --env="NAMESPACE=$NAMESPACE" \
+    -- /bin/bash
+```
+
+**Send a completion request:**
+
+```bash
+curl -X POST http://${IP}/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "prompt": "How are you today?"
+    }' | jq
+```
+
+Verify that you receive a valid JSON response containing the generated text from the model.
+
+---
+
+## Scale-Up
+
+Once the snapshot is successfully created, we can test scaling up the deployment.
+
+### 1. Scale Up the Deployment
+
+Scale the deployment to 3 replicas:
+
+```bash
+kubectl scale deployment pod-snapshot-gpu-vllm-decode --replicas=3 -n ${NAMESPACE}
 ```
 
 ### 2. Observe Warm Start Events
@@ -208,33 +292,18 @@ Watch the events of the new warm-started pod:
 ```bash
 kubectl get events \
   --field-selector involvedObject.name=pod-snapshot-gpu-vllm-decode-<new-pod-suffix> \
-  -o custom-columns='NAME:.involvedObject.name,TIME:.metadata.creationTimestamp,REASON:.reason,MESSAGE:.message'
+  -o custom-columns='LAST_SEEN:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message'
 ```
 
 Output:
 ```
-NAME                                           TIME                   REASON               MESSAGE
-pod-snapshot-gpu-vllm-decode-8689478d99-gdzvv   2026-06-09T17:45:33Z   Scheduled            Successfully assigned default/pod-snapshot-gpu-vllm-decode-8689478d99-gdzvv to gke-snapshot-test-l4-28881afe-4lbm
-pod-snapshot-gpu-vllm-decode-8689478d99-gdzvv   2026-06-09T17:45:35Z   Pulled               Container image "vllm/vllm-openai:v0.8.5" already present on machine and can be accessed by the pod
-pod-snapshot-gpu-vllm-decode-8689478d99-gdzvv   2026-06-09T17:45:35Z   Created              Container created
-pod-snapshot-gpu-vllm-decode-8689478d99-gdzvv   2026-06-09T17:45:39Z   Started              Container started
-pod-snapshot-gpu-vllm-decode-8689478d99-gdzvv   2026-06-09T17:47:14Z   GKEPodSnapshotting   Successfully restored the pod from PodSnapshot default/a5622707-38be-431c-ab79-18d1523606c5
-```
-
-### Startup Time Improvement Analysis (TBD)
-
-Based on benchmarks, here is the performance comparison:
-
-| Metric | Startup Time |
-| :--- | :--- |
-| **Cold Start (w/o Image Pull)** | 377) |
-| **Warm Start (Restore)** | 101s |
-| **Startup Improvement** | **~68.1%** |
-
-*(If including image pulling overhead or comparing against a pre-downloaded baseline, performance gains can range up to 83.6%).*
-
----
-
+LAST_SEEN            TYPE      REASON             MESSAGE
+2026-06-22T21:20:50Z   Normal    Scheduled                 Successfully assigned llm-d-pod-snapshot/pod-snapshot-gpu-vllm-decode-744b8cf49-4825r to gke-snapshot-test-l4-stable-e3adc226-q6lh
+2026-06-22T21:20:51Z   Normal    Pulling                   Pulling image "vllm/vllm-openai:v0.19.1"
+2026-06-22T21:20:54Z   Normal    Pulled                    Successfully pulled image "vllm/vllm-openai:v0.19.1" in 2.606s (2.606s including waiting). Image size: 9612695005 bytes.
+2026-06-22T21:20:54Z   Normal    Created                   Container created
+2026-06-22T21:20:59Z   Normal    Started                   Container started
+2026-06-22T21:21:07Z   Normal    GKEPodSnapshotting        Successfully restored the pod from PodSnapshot llm-d-pod-snapshot/ca5b05f0-8253-4975-adb9-c1eec9e8a71e
 ## Cleanup
 
 Uninstall the router and delete the model server components:

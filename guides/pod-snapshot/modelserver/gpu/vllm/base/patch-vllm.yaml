@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: decode
 spec:
-  replicas: 1
+  replicas: 2
   template:
     spec:
       containers:
@@ -24,7 +24,6 @@ spec:
           resources:
             limits:
               cpu: '8'
-              memory: 48Gi
               nvidia.com/gpu: 1
             requests:
               cpu: '4'
@@ -33,12 +32,8 @@ spec:
           volumeMounts:
             - mountPath: /dev/shm
               name: shm
-            - mountPath: /.cache
-              name: torch-compile-cache
-            - mountPath: /.triton
-              name: triton-cache
-            - mountPath: /.config
-              name: vllm-config
+            - mountPath: /root/.cache/huggingface
+              name: hf-cache
           startupProbe:
             initialDelaySeconds: 15
             periodSeconds: 30
@@ -57,9 +52,5 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 10Gi
-        - name: torch-compile-cache
-          emptyDir: {}
-        - name: triton-cache
-          emptyDir: {}
-        - name: vllm-config
+        - name: hf-cache
           emptyDir: {}
