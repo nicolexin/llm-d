@@ -3,7 +3,7 @@ kind: Kustomization
 resources:
   - ../../../../../recipes/modelserver/base/single-host/default
 
-namePrefix: pod-snapshot-gpu-vllm-
+namePrefix: fast-startup-gpu-vllm-
 
 images:
   - name: REPLACE_MODEL_SERVER_IMAGE
@@ -12,7 +12,7 @@ images:
 
 labels:
   - pairs:
-      llm-d.ai/guide: pod-snapshot
+      llm-d.ai/guide: fast-startup
       llm-d.ai/model: Llama-3.1-8B-Instruct
       llm-d.ai/accelerator-variant: gpu
       llm-d.ai/accelerator-vendor: nvidia

@@ -1,4 +1,4 @@
-## pod-snapshot guide overrides for the llm-d router.
+## fast-startup guide overrides for the llm-d router.
 ## Layer on top of: recipes/router/base.values.yaml
 
 router:
@@ -33,4 +33,4 @@ router:
 
   modelServers:
     matchLabels:
-      llm-d.ai/guide: "pod-snapshot"
+      llm-d.ai/guide: "fast-startup"
