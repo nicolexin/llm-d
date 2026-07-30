@@ -108,6 +108,9 @@ spec:
             exec:
               command: ["pg_isready", "-U", "litellm", "-d", "litellm"]
             initialDelaySeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -291,13 +294,50 @@ Expected output showing both self-hosted and external models:
 }
 ```
 
-### 3. Test Inference Requests
+### 3. Generate Scoped Virtual Key with Budget and Rate Limits
+
+Use the admin master key to provision a scoped virtual key with model access restrictions, a $10 budget cap, and a 60 RPM rate limit:
+
+```bash
+KEY_RESP=$(curl -s http://127.0.0.1:4000/key/generate \
+  -H "Authorization: Bearer $MK" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "models": ["qwen/qwen3-32B", "gemini-flash"],
+    "max_budget": 10.0,
+    "rpm_limit": 60,
+    "duration": "30d",
+    "metadata": {"team": "analytics"}
+  }')
+
+echo "$KEY_RESP" | jq .
+
+# Export the generated virtual key for client inference:
+export VIRTUAL_KEY=$(echo "$KEY_RESP" | jq -r .key)
+```
+
+Expected output:
+
+```json
+{
+  "key": "<generated-virtual-key>",
+  "max_budget": 10.0,
+  "spend": 0.0,
+  "models": ["qwen/qwen3-32B", "gemini-flash"],
+  "rpm_limit": 60,
+  "duration": "30d"
+}
+```
+
+### 4. Test Inference Requests with Virtual Key
+
+Client applications use their scoped virtual key (`$VIRTUAL_KEY`) rather than the admin master key.
 
 #### A. Call Self-Hosted Model (`qwen/qwen3-32B` via llm-d)
 
 ```bash
 curl -s -m 45 http://127.0.0.1:4000/v1/chat/completions \
-  -H "Authorization: Bearer $MK" \
+  -H "Authorization: Bearer $VIRTUAL_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen/qwen3-32B",
@@ -337,7 +377,7 @@ Expected output (containing `vllm` fingerprint, confirming execution through llm
 
 ```bash
 curl -s -m 45 http://127.0.0.1:4000/v1/chat/completions \
-  -H "Authorization: Bearer $MK" \
+  -H "Authorization: Bearer $VIRTUAL_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemini-flash",
@@ -368,6 +408,30 @@ Expected output (translated OpenAI format returned from Gemini):
     "prompt_tokens": 2,
     "completion_tokens": 9,
     "total_tokens": 11
+  }
+}
+```
+
+### 5. Check Spend Tracking and Remaining Budget
+
+Query the database via LiteLLM's key management endpoint to verify spend auditing:
+
+```bash
+curl -s "http://127.0.0.1:4000/key/info?key=$VIRTUAL_KEY" \
+  -H "Authorization: Bearer $MK" | jq .
+```
+
+Expected output:
+
+```json
+{
+  "key": "<generated-virtual-key>",
+  "info": {
+    "spend": 0.00042,
+    "max_budget": 10.0,
+    "models": ["qwen/qwen3-32B", "gemini-flash"],
+    "rpm_limit": 60,
+    "user_id": "team-analytics"
   }
 }
 ```

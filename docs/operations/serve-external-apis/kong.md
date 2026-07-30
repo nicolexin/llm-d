@@ -72,7 +72,7 @@ helm repo add kong https://charts.konghq.com
 helm repo update
 
 helm install kong kong/ingress -n "$NAMESPACE"
-kubectl -n "$NAMESPACE" rollout status deploy -l app.kubernetes.io/name=ingress
+kubectl -n "$NAMESPACE" wait --for=condition=Available deploy -l app.kubernetes.io/name=ingress --timeout=300s
 ```
 
 Inspect the deployed services:
@@ -96,11 +96,11 @@ service/kong-gateway-manager                 NodePort       <cluster-ip>   <none
 service/kong-gateway-proxy                   LoadBalancer   <cluster-ip>   <proxy-ip>    80:32117/TCP,443:30425/TCP
 ```
 
-Export the proxy LoadBalancer IP for verification commands:
+Export the proxy LoadBalancer IP or hostname for verification commands:
 
 ```bash
 export PROXY_IP=$(kubectl -n "$NAMESPACE" get svc kong-gateway-proxy \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}')
 ```
 
 
@@ -189,7 +189,7 @@ metadata:
   name: qwen3-32b
   namespace: kong
   annotations:
-    konghq.com/plugins: ai-proxy-qwen3-32b
+    konghq.com/plugins: ai-proxy-qwen3-32b, key-auth, rate-limiting
     konghq.com/strip-path: "true"
 spec:
   parentRefs:
@@ -227,7 +227,7 @@ metadata:
   name: qwen3-32b-standalone
   namespace: kong
   annotations:
-    konghq.com/plugins: ai-proxy-qwen3-32b-standalone
+    konghq.com/plugins: ai-proxy-qwen3-32b-standalone, key-auth, rate-limiting
     konghq.com/strip-path: "true"
 spec:
   parentRefs:
@@ -272,7 +272,7 @@ metadata:
   name: gemini-flash
   namespace: kong
   annotations:
-    konghq.com/plugins: ai-proxy-gemini-flash
+    konghq.com/plugins: ai-proxy-gemini-flash, key-auth, rate-limiting
     konghq.com/strip-path: "true"
 spec:
   parentRefs:
@@ -285,9 +285,35 @@ spec:
       backendRefs:
         - name: ai-placeholder
           port: 80
+---
+# ─────────────────────────────────────────────────────────────────────
+# 4) SECURITY & GOVERNANCE: key-auth and rate-limiting
+# Enforces client authentication and request rate limits across all routes.
+# ─────────────────────────────────────────────────────────────────────
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: key-auth
+  namespace: kong
+plugin: key-auth
+config:
+  key_names:
+    - apikey
+    - Authorization
+  hide_credentials: true
+---
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: rate-limiting
+  namespace: kong
+plugin: rate-limiting
+config:
+  minute: 60
+  policy: local
 ```
 
-Apply the route definitions:
+Apply the route definitions and security plugins:
 
 ```bash
 kubectl apply -f models.yaml
@@ -297,16 +323,38 @@ kubectl apply -f models.yaml
 > - **Placeholder Backend**: Gateway API `HTTPRoute` resources require a `backendRef`. Because Kong's `ai-proxy` plugin overrides upstream routing entirely (forwarding directly to `upstream_url` or external API endpoints), the `ai-placeholder` backend Service defined in Step 3 is never contacted.
 > - **Model Pinning**: `ai-proxy` pins the model per route. Clients can omit `"model"` in the request body; if provided, it must match `model.name`, otherwise Kong returns HTTP `400 Bad Request`.
 
+Next, provision an authorized client consumer and API key credentials:
+
+```bash
+# 1) Generate a client API key and store it in a Kubernetes Secret
+CLIENT_KEY="key-$(openssl rand -hex 16)"
+
+kubectl -n "$NAMESPACE" create secret generic client-app-key \
+  --from-literal=kongCredType=key-auth \
+  --from-literal=key="$CLIENT_KEY"
+
+# 2) Create the KongConsumer referencing the credential Secret
+kubectl apply -f - <<EOF
+apiVersion: configuration.konghq.com/v1
+kind: KongConsumer
+metadata:
+  name: client-app
+  namespace: kong
+credentials:
+  - client-app-key
+EOF
+```
+
 ---
 
 ## Step 5: Verification
 
 ### 1. Verify Gateway API Resource Programming
 
-Check that all Gateway API resources and Kong plugins are accepted and programmed:
+Check that all Gateway API resources, Kong plugins, and consumers are programmed:
 
 ```bash
-kubectl -n "$NAMESPACE" get gateway,httproute,kongplugin
+kubectl -n "$NAMESPACE" get gateway,httproute,kongplugin,kongconsumer
 ```
 
 Expected output:
@@ -324,15 +372,45 @@ NAME                                                               PLUGIN-TYPE  
 kongplugin.configuration.konghq.com/ai-proxy-gemini-flash         ai-proxy      69m
 kongplugin.configuration.konghq.com/ai-proxy-qwen3-32b            ai-proxy      71m
 kongplugin.configuration.konghq.com/ai-proxy-qwen3-32b-standalone ai-proxy      71m
+kongplugin.configuration.konghq.com/key-auth                      key-auth      71m
+kongplugin.configuration.konghq.com/rate-limiting                 rate-limiting 71m
+
+NAME                                          AGE
+kongconsumer.configuration.konghq.com/client-app 5m
 ```
 
-### 2. Call All Configured Models
+### 2. Verify Authentication Enforcement (Security Check)
+
+Attempt an unauthenticated request to verify that Kong blocks unauthorized access:
+
+```bash
+curl -i -s http://$PROXY_IP/gemini-flash \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "hi"}]}'
+```
+
+Expected response (HTTP 401 Unauthorized):
+
+```text
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json; charset=utf-8
+Connection: keep-alive
+
+{
+  "message": "No API key found in request"
+}
+```
+
+### 3. Call Configured Models with Client Authentication
 
 #### A. Call Self-Hosted Model (`/qwen3-32b` via Gateway Mode)
+
+Pass the client API key via the `apikey` header:
 
 ```bash
 curl -s -m 45 http://$PROXY_IP/qwen3-32b \
   -H "Content-Type: application/json" \
+  -H "apikey: $CLIENT_KEY" \
   -d '{
     "messages": [{"role": "user", "content": "hi"}],
     "max_tokens": 16
@@ -370,6 +448,7 @@ Expected response (showing vLLM system fingerprint from llm-d):
 ```bash
 curl -s -m 45 http://$PROXY_IP/qwen3-32b-standalone \
   -H "Content-Type: application/json" \
+  -H "apikey: $CLIENT_KEY" \
   -d '{
     "messages": [{"role": "user", "content": "hi"}],
     "max_tokens": 16
@@ -378,11 +457,12 @@ curl -s -m 45 http://$PROXY_IP/qwen3-32b-standalone \
 
 #### C. Call External Model (`/gemini-flash` via Google AI Studio API)
 
-Kong translates the OpenAI request format into Gemini API format and injects the API key automatically:
+Kong validates the client's `apikey`, translates the OpenAI request format into Gemini API format, and injects the upstream Gemini API key:
 
 ```bash
 curl -s -m 45 http://$PROXY_IP/gemini-flash \
   -H "Content-Type: application/json" \
+  -H "apikey: $CLIENT_KEY" \
   -d '{
     "messages": [{"role": "user", "content": "Reply with just: GEMINI-OK"}],
     "max_tokens": 16
@@ -422,6 +502,8 @@ To remove the Kong AI Gateway deployment and all associated resources:
 
 ```bash
 kubectl delete -f models.yaml -n "$NAMESPACE"
+kubectl delete kongconsumer client-app -n "$NAMESPACE" --ignore-not-found
+kubectl delete secret client-app-key -n "$NAMESPACE" --ignore-not-found
 kubectl delete -f kong-gateway.yaml -n "$NAMESPACE"
 helm uninstall kong -n "$NAMESPACE"
 kubectl delete namespace "$NAMESPACE"

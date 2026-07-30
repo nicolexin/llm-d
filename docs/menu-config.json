@@ -86,8 +86,8 @@
     "operations/rollouts/blue-green-update": { "position": 2 },
     "operations/serve-external-apis/litellm": { "position": 1, "label": "LiteLLM Integration" },
     "operations/serve-external-apis/kong": { "position": 2, "label": "Kong AI Gateway Integration" },
-    "operations/router": { "position": 4, "label": "Router Operations Guide" },
-    "operations/async-processor": { "position": 5, "label": "Async Processor Operations Guide" },
+    "operations/router": { "position": 5, "label": "Router Operations Guide" },
+    "operations/async-processor": { "position": 6, "label": "Async Processor Operations Guide" },
 
     "infrastructure/multi-node": { "position": 3, "label": "Kubernetes Multi-Node Orchestration" },
     "infrastructure/no-kubernetes-deployment": { "position": 4, "label": "Non-K8s & Bare-Metal Deployments" },
