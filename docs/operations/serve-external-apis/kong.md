@@ -53,7 +53,7 @@ kubectl -n "$NAMESPACE" create secret generic ai-provider-keys \
 ```
 
 > [!IMPORTANT]
-> Replace `<your-gemini-api-key>` with your actual Google AI Studio API key. Embedded double quotes are required for Kong plugin string matching.
+> Replace `<your-gemini-api-key>` with your actual Google AI Studio API key. Kong Ingress Controller substitutes `configPatches` values directly as JSON; string values require embedded double quotes (e.g. `"\"$GEMINI_API_KEY\""`), whereas numeric or boolean patch values do not.
 
 ---
 
@@ -160,7 +160,7 @@ kubectl apply -f kong-gateway.yaml
 ## Step 4: Configure Routes and `ai-proxy` Plugins
 
 > [!WARNING]
-> **Explicit Port Requirement**: `upstream_url` **must** include an explicit port (e.g., `:80`). Without an explicit port, Kong's `openai` provider defaults to port 443 even for `http://` URLs, causing connection timeouts and returning `503 The upstream server is currently unavailable`.
+> **Explicit Port Requirement**: Include an explicit port in `upstream_url` (e.g., `:80`). In some Kong Gateway versions, the `openai` provider defaults to port 443 even for `http://` URLs (though this may no longer be true in newer releases, e.g., 3.8 and above), causing connection timeouts and returning `503 The upstream server is currently unavailable`.
 
 Create `models.yaml`:
 
@@ -418,7 +418,7 @@ Expected response (showing vLLM system fingerprint from llm-d):
 
 ```json
 {
-  "id": "chatcmpl-f62cc54f-26e3-47b7-8339-69d9d4cef43b",
+  "id": "<response-id>",
   "object": "chat.completion",
   "model": "Qwen/Qwen3-32B",
   "system_fingerprint": "vllm-0.23.0-tp2-a536750c",
@@ -470,7 +470,7 @@ Expected response:
 
 ```json
 {
-  "id": "chatcmpl-gemini-3.5-flash-12345",
+  "id": "<response-id>",
   "object": "chat.completion",
   "model": "gemini-3.5-flash",
   "choices": [

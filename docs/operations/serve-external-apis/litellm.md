@@ -338,7 +338,7 @@ KEY_RESP=$(curl -s http://127.0.0.1:4000/key/generate \
     "max_budget": 10.0,
     "rpm_limit": 60,
     "duration": "30d",
-    "metadata": {"team": "analytics"}
+    "user_id": "team-analytics"
   }')
 
 echo "$KEY_RESP" | jq .
@@ -381,7 +381,7 @@ Expected output (containing `vllm` fingerprint, confirming execution through llm
 
 ```json
 {
-  "id": "chatcmpl-dd9ecb6e-3c0e-4645-9746-2546fb0374a6",
+  "id": "<response-id>",
   "object": "chat.completion",
   "created": 1783624185,
   "model": "qwen/qwen3-32B",
@@ -421,7 +421,7 @@ Expected output (translated OpenAI format returned from Gemini):
 
 ```json
 {
-  "id": "tvFPatnjKqvWjMcP4t-ymQ0",
+  "id": "<response-id>",
   "object": "chat.completion",
   "created": 1783624118,
   "model": "gemini-flash",
