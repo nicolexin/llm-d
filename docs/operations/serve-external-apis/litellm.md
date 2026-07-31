@@ -66,7 +66,10 @@ kubectl -n "$NAMESPACE" create secret generic litellm-env \
 
 ## Step 2: Set Up Postgres StatefulSet
 
-LiteLLM requires a database to manage virtual keys, model aliases, spend metrics, and audit logs. Spin up a single-replica PostgreSQL `StatefulSet`:
+LiteLLM requires PostgreSQL to store durable state: virtual keys, user spend metrics, model aliases, and audit logs. Deploy a single-replica PostgreSQL `StatefulSet`:
+
+> [!NOTE]
+> **Why Postgres is deployed separately while Redis is bundled**: PostgreSQL stores *durable state* that production teams typically manage separately. In contrast, Redis acts as an *ephemeral coordination store* for cross-pod rate limiting and locks, which the LiteLLM Helm chart bundles and provisions automatically in Step 3 via `redis.enabled: true`.
 
 Create `postgres.yaml`:
 
@@ -157,6 +160,11 @@ image:
   repository: ghcr.io/berriai/litellm-database   # Bundled Prisma client for DB migrations
   tag: "v1.90.2"
 
+# Ephemeral coordination store: cross-pod RPM/TPM limits, spend tracking, pod locks
+redis:
+  enabled: true
+  architecture: standalone
+
 # Admin master key secret reference
 masterkeySecretName: litellm-secrets
 masterkeySecretKey: master-key
@@ -197,6 +205,15 @@ proxy_config:
         model: hosted_vllm/Qwen/Qwen3-32B
         api_base: http://<gateway-ip>/v1
         api_key: "none"          # llm-d requires no API key
+        # Self-hosted models have no public price. These are chargeback rates —
+        # amortized GPU cost, not a vendor price. Replace with your own:
+        #   tokens_per_hour = 3600 x sustained_output_tok/s x utilization
+        #   output_cost_per_token = (GPU $/hr x GPUs) / tokens_per_hour
+        # Without these, LiteLLM records spend=0 for llm-d models and the
+        # max_budget below only ever counts Gemini.
+        model_info:
+          input_cost_per_token: 0.0000008   # $0.80 per 1M input tokens
+          output_cost_per_token: 0.0000024  # $2.40 per 1M output tokens
 
     # ─────────────────────────────────────────────────────────────────
     # 2) OPTIONAL: llm-d Standalone Mode
@@ -207,6 +224,15 @@ proxy_config:
         model: hosted_vllm/Qwen/Qwen3-32B
         api_base: http://optimized-baseline-epp.llm-d-optimized-baseline.svc.cluster.local:80/v1
         api_key: "none"
+        # Self-hosted models have no public price. These are chargeback rates —
+        # amortized GPU cost, not a vendor price. Replace with your own:
+        #   tokens_per_hour = 3600 x sustained_output_tok/s x utilization
+        #   output_cost_per_token = (GPU $/hr x GPUs) / tokens_per_hour
+        # Without these, LiteLLM records spend=0 for llm-d models and the
+        # max_budget below only ever counts Gemini.
+        model_info:
+          input_cost_per_token: 0.0000008   # $0.80 per 1M input tokens
+          output_cost_per_token: 0.0000024  # $2.40 per 1M output tokens
 
     # ─────────────────────────────────────────────────────────────────
     # 3) EXTERNAL API: Google Gemini
@@ -217,6 +243,10 @@ proxy_config:
         model: gemini/gemini-3.5-flash
         api_key: os.environ/GEMINI_API_KEY
 ```
+
+> [!NOTE]
+> - **Bundled Redis Coordination**: Enabling `redis.enabled: true` instructs the Helm chart to deploy a standalone Redis instance (`litellm-redis-master:6379`) and automatically wire `REDIS_HOST` and `general_settings.coordination_redis` into all 3 LiteLLM pods. This guarantees cluster-wide enforcement of RPM limits (e.g. `rpm_limit: 60`) and virtual key budgets across all replicas. If using an external managed Redis instance, keep `redis.enabled: false` and inject `REDIS_HOST`/`REDIS_PORT` via the `litellm-env` Secret.
+> - **Self-Hosted Model Cost Tracking (`model_info`)**: Commercial models (like `gemini-3.5-flash`) have pre-configured pricing in LiteLLM's public pricing dictionary. Self-hosted models (`hosted_vllm/*`) require explicit `model_info` with `input_cost_per_token` and `output_cost_per_token` so LiteLLM can track usage spend and deduct from virtual key budgets accurately.
 
 ### Install via Helm
 
@@ -241,9 +271,10 @@ kubectl get svc -n "$NAMESPACE"
 
 Expected output:
 ```text
-NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE
-litellm    ClusterIP   <cluster-ip>   <none>        4000/TCP   12h
-postgres   ClusterIP   <cluster-ip>   <none>        5432/TCP   12h
+NAME                   TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE
+litellm                ClusterIP   <cluster-ip>   <none>        4000/TCP   12h
+litellm-redis-master   ClusterIP   <cluster-ip>   <none>        6379/TCP   12h
+postgres               ClusterIP   <cluster-ip>   <none>        5432/TCP   12h
 ```
 
 ### 1. Establish Port Forwarding
@@ -440,7 +471,7 @@ Expected output:
 
 ## Cleanup
 
-To remove the LiteLLM proxy, PostgreSQL database, and all associated resources:
+To remove the LiteLLM proxy (including bundled Redis), PostgreSQL database, and all associated resources:
 
 ```bash
 helm uninstall litellm -n "$NAMESPACE"

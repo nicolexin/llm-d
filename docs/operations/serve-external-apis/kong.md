@@ -72,7 +72,7 @@ helm repo add kong https://charts.konghq.com
 helm repo update
 
 helm install kong kong/ingress -n "$NAMESPACE"
-kubectl -n "$NAMESPACE" wait --for=condition=Available deploy -l app.kubernetes.io/name=ingress --timeout=300s
+kubectl -n "$NAMESPACE" wait --for=condition=Available deploy/kong-controller deploy/kong-gateway --timeout=300s
 ```
 
 Inspect the deployed services:
@@ -143,10 +143,10 @@ metadata:
   name: ai-placeholder
   namespace: kong
 spec:
-  type: ExternalName
-  externalName: localhost
+  type: ClusterIP
   ports:
     - port: 80
+      targetPort: 80
 ```
 
 Apply the resources:
@@ -190,7 +190,6 @@ metadata:
   namespace: kong
   annotations:
     konghq.com/plugins: ai-proxy-qwen3-32b, key-auth, rate-limiting
-    konghq.com/strip-path: "true"
 spec:
   parentRefs:
     - name: kong
@@ -228,7 +227,6 @@ metadata:
   namespace: kong
   annotations:
     konghq.com/plugins: ai-proxy-qwen3-32b-standalone, key-auth, rate-limiting
-    konghq.com/strip-path: "true"
 spec:
   parentRefs:
     - name: kong
@@ -273,7 +271,6 @@ metadata:
   namespace: kong
   annotations:
     konghq.com/plugins: ai-proxy-gemini-flash, key-auth, rate-limiting
-    konghq.com/strip-path: "true"
 spec:
   parentRefs:
     - name: kong
@@ -299,7 +296,6 @@ plugin: key-auth
 config:
   key_names:
     - apikey
-    - Authorization
   hide_credentials: true
 ---
 apiVersion: configuration.konghq.com/v1
@@ -320,7 +316,8 @@ kubectl apply -f models.yaml
 ```
 
 > [!NOTE]
-> - **Placeholder Backend**: Gateway API `HTTPRoute` resources require a `backendRef`. Because Kong's `ai-proxy` plugin overrides upstream routing entirely (forwarding directly to `upstream_url` or external API endpoints), the `ai-placeholder` backend Service defined in Step 3 is never contacted.
+> - **Fail-Closed Placeholder Backend**: Gateway API `HTTPRoute` requires a valid `backendRef`. Because `ai-proxy` replaces the upstream request path with the target model's `upstream_url`, the `ai-placeholder` Service is not normally reached. Using a selector-less `ClusterIP` Service ensures that if an `ai-proxy` plugin fails to program or is missing, Kong fails closed with an immediate `503 Service Unavailable` rather than proxying to localhost.
+> - **Authentication Header**: Kong's `key-auth` plugin compares the full header value and does not strip a `Bearer ` prefix, so clients pass keys via the `apikey` header (`-H "apikey: $CLIENT_KEY"`). OpenAI SDK clients can send this with `default_headers={"apikey": CLIENT_KEY}`. If a client can only send `Authorization: Bearer <key>`, add a Kong `pre-function` plugin to copy the token into `apikey` and clear the original header before `key-auth` runs.
 > - **Model Pinning**: `ai-proxy` pins the model per route. Clients can omit `"model"` in the request body; if provided, it must match `model.name`, otherwise Kong returns HTTP `400 Bad Request`.
 
 Next, provision an authorized client consumer and API key credentials:

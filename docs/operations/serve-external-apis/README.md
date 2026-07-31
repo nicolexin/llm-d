@@ -4,7 +4,7 @@ This section covers how to deploy an API gateway or proxy layer on top of **llm-
 
 By deploying a unified proxy front-ending your LLM infrastructure, you can:
 - **Centralize API Key & Secret Management**: Store external provider keys securely in Kubernetes Secrets rather than distributing them to client applications.
-- **Provide a Unified OpenAI-Compatible Interface**: Allow client applications to switch seamlessly between self-hosted llm-d model endpoints and external SaaS LLM providers by changing only the requested model name.
+- **Provide a Unified OpenAI-Compatible Interface**: Allow client applications to switch seamlessly between self-hosted llm-d model endpoints and external SaaS LLM providers.
 - **Enforce Security & Rate Limiting**: Apply enterprise governance, authentication, token budgeting, and logging at a single entry point.
 
 ---
