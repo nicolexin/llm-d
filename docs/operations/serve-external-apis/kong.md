@@ -6,8 +6,6 @@ This guide demonstrates how to deploy **Kong AI Gateway** (Helm chart, DB-less m
 
 ## Overview
 
-This document provides a production-ready setup guide for deploying **Kong AI Gateway** (Helm chart, DB-less mode, Kong Ingress Controller) on Kubernetes to route traffic across an existing **llm-d inference stack** and an external API provider.
-
 A single Kong AI Gateway deployment can front both:
 
 1. **In-cluster model endpoints**: An existing llm-d inference stack serving models in your Kubernetes cluster (via the `ai-proxy` plugin pointing an `openai` provider at the llm-d endpoint).
@@ -30,6 +28,9 @@ End users can:
      `http://optimized-baseline-epp.llm-d-optimized-baseline.svc.cluster.local:80/v1`.
 3. **External Provider API Key**: An API key from Google AI Studio for `gemini-3.5-flash`.
 4. **Local Tools**: `kubectl`, `helm`, and `curl`.
+
+> [!NOTE]
+> **Validated Versions**: This guide was tested and verified with Kong Gateway `v3.9.3`, Kong Ingress Controller `v3.5.0` (`kong/ingress` Helm chart `v0.24.0`), and Gateway API `v1.2.1`.
 
 Set up the Kong target namespace:
 
@@ -126,7 +127,6 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: kong
-  namespace: kong
 spec:
   gatewayClassName: kong
   listeners:
@@ -141,7 +141,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: ai-placeholder
-  namespace: kong
 spec:
   type: ClusterIP
   ports:
@@ -152,7 +151,7 @@ spec:
 Apply the resources:
 
 ```bash
-kubectl apply -f kong-gateway.yaml
+kubectl apply -n "$NAMESPACE" -f kong-gateway.yaml
 ```
 
 ---
@@ -160,7 +159,14 @@ kubectl apply -f kong-gateway.yaml
 ## Step 4: Configure Routes and `ai-proxy` Plugins
 
 > [!WARNING]
-> **Explicit Port Requirement**: Include an explicit port in `upstream_url` (e.g., `:80`). In some Kong Gateway versions, the `openai` provider defaults to port 443 even for `http://` URLs (though this may no longer be true in newer releases, e.g., 3.8 and above), causing connection timeouts and returning `503 The upstream server is currently unavailable`.
+> **Explicit Port Requirement**: Always include an explicit port in `upstream_url` (e.g., `http://<gateway-ip>:80/...`). Omitting the port causes connection timeouts and returns `503 The upstream server is currently unavailable` on Kong Gateway versions prior to 3.8, where the `openai` driver defaults to port 443 even for `http://` URLs. Specifying `:80` is harmless and ensures compatibility across all Kong Gateway releases.
+
+Retrieve the llm-d Gateway IP to substitute for `<gateway-ip>`:
+
+```bash
+kubectl -n llm-d-optimized-baseline get gateway llm-d-inference-gateway \
+  -o jsonpath='{.status.addresses[0].value}'
+```
 
 Create `models.yaml`:
 
@@ -168,12 +174,12 @@ Create `models.yaml`:
 # ─────────────────────────────────────────────────────────────────────
 # 1) DEFAULT: llm-d Gateway Mode
 # Routes to the llm-d Gateway API endpoint (InferenceGateway).
+# Points to your Kubernetes Gateway IP (from kubectl get gateway).
 # ─────────────────────────────────────────────────────────────────────
 apiVersion: configuration.konghq.com/v1
 kind: KongPlugin
 metadata:
   name: ai-proxy-qwen3-32b
-  namespace: kong
 plugin: ai-proxy
 config:
   route_type: llm/v1/chat
@@ -181,13 +187,12 @@ config:
     provider: openai
     name: Qwen/Qwen3-32B      # Must match backend model ID
     options:
-      upstream_url: http://<gateway-ip>/v1/chat/completions
+      upstream_url: http://<gateway-ip>:80/v1/chat/completions
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: qwen3-32b
-  namespace: kong
   annotations:
     konghq.com/plugins: ai-proxy-qwen3-32b, key-auth, rate-limiting
 spec:
@@ -210,7 +215,6 @@ apiVersion: configuration.konghq.com/v1
 kind: KongPlugin
 metadata:
   name: ai-proxy-qwen3-32b-standalone
-  namespace: kong
 plugin: ai-proxy
 config:
   route_type: llm/v1/chat
@@ -224,7 +228,6 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: qwen3-32b-standalone
-  namespace: kong
   annotations:
     konghq.com/plugins: ai-proxy-qwen3-32b-standalone, key-auth, rate-limiting
 spec:
@@ -247,7 +250,6 @@ apiVersion: configuration.konghq.com/v1
 kind: KongPlugin
 metadata:
   name: ai-proxy-gemini-flash
-  namespace: kong
 plugin: ai-proxy
 config:
   route_type: llm/v1/chat
@@ -268,7 +270,6 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: gemini-flash
-  namespace: kong
   annotations:
     konghq.com/plugins: ai-proxy-gemini-flash, key-auth, rate-limiting
 spec:
@@ -291,7 +292,6 @@ apiVersion: configuration.konghq.com/v1
 kind: KongPlugin
 metadata:
   name: key-auth
-  namespace: kong
 plugin: key-auth
 config:
   key_names:
@@ -302,7 +302,6 @@ apiVersion: configuration.konghq.com/v1
 kind: KongPlugin
 metadata:
   name: rate-limiting
-  namespace: kong
 plugin: rate-limiting
 config:
   minute: 60
@@ -312,31 +311,39 @@ config:
 Apply the route definitions and security plugins:
 
 ```bash
-kubectl apply -f models.yaml
+kubectl apply -n "$NAMESPACE" -f models.yaml
 ```
 
 > [!NOTE]
 > - **Fail-Closed Placeholder Backend**: Gateway API `HTTPRoute` requires a valid `backendRef`. Because `ai-proxy` replaces the upstream request path with the target model's `upstream_url`, the `ai-placeholder` Service is not normally reached. Using a selector-less `ClusterIP` Service ensures that if an `ai-proxy` plugin fails to program or is missing, Kong fails closed with an immediate `503 Service Unavailable` rather than proxying to localhost.
 > - **Authentication Header**: Kong's `key-auth` plugin compares the full header value and does not strip a `Bearer ` prefix, so clients pass keys via the `apikey` header (`-H "apikey: $CLIENT_KEY"`). OpenAI SDK clients can send this with `default_headers={"apikey": CLIENT_KEY}`. If a client can only send `Authorization: Bearer <key>`, add a Kong `pre-function` plugin to copy the token into `apikey` and clear the original header before `key-auth` runs.
+> - **Local Rate Limiting (`policy: local`)**: Counters are stored in pod memory with zero external dependencies, meaning the 60 req/min limit applies independently per Kong data-plane replica (e.g., 60 × N req/min total across N replicas). For strict cluster-wide rate limiting across multiple replicas, configure `policy: redis` with a shared Redis instance.
 > - **Model Pinning**: `ai-proxy` pins the model per route. Clients can omit `"model"` in the request body; if provided, it must match `model.name`, otherwise Kong returns HTTP `400 Bad Request`.
 
 Next, provision an authorized client consumer and API key credentials:
 
 ```bash
-# 1) Generate a client API key and store it in a Kubernetes Secret
+# 1) Generate a client API key and store it in a labeled credential Secret
 CLIENT_KEY="key-$(openssl rand -hex 16)"
 
-kubectl -n "$NAMESPACE" create secret generic client-app-key \
-  --from-literal=kongCredType=key-auth \
-  --from-literal=key="$CLIENT_KEY"
-
+kubectl apply -n "$NAMESPACE" -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: client-app-key
+  labels:
+    konghq.com/credential: key-auth
+stringData:
+  key: "$CLIENT_KEY"
+---
 # 2) Create the KongConsumer referencing the credential Secret
-kubectl apply -f - <<EOF
 apiVersion: configuration.konghq.com/v1
 kind: KongConsumer
 metadata:
   name: client-app
-  namespace: kong
+  annotations:
+    kubernetes.io/ingress.class: kong
+username: client-app
 credentials:
   - client-app-key
 EOF
@@ -365,15 +372,15 @@ httproute.gateway.networking.k8s.io/gemini-flash                        77m
 httproute.gateway.networking.k8s.io/qwen3-32b                           77m
 httproute.gateway.networking.k8s.io/qwen3-32b-standalone                77m
 
-NAME                                                               PLUGIN-TYPE   AGE   PROGRAMMED
-kongplugin.configuration.konghq.com/ai-proxy-gemini-flash         ai-proxy      69m
-kongplugin.configuration.konghq.com/ai-proxy-qwen3-32b            ai-proxy      71m
-kongplugin.configuration.konghq.com/ai-proxy-qwen3-32b-standalone ai-proxy      71m
-kongplugin.configuration.konghq.com/key-auth                      key-auth      71m
-kongplugin.configuration.konghq.com/rate-limiting                 rate-limiting 71m
+NAME                                                               PLUGIN-TYPE     AGE   PROGRAMMED
+kongplugin.configuration.konghq.com/ai-proxy-gemini-flash         ai-proxy        69m   True
+kongplugin.configuration.konghq.com/ai-proxy-qwen3-32b            ai-proxy        71m   True
+kongplugin.configuration.konghq.com/ai-proxy-qwen3-32b-standalone ai-proxy        71m   True
+kongplugin.configuration.konghq.com/key-auth                      key-auth        71m   True
+kongplugin.configuration.konghq.com/rate-limiting                 rate-limiting   71m   True
 
-NAME                                          AGE
-kongconsumer.configuration.konghq.com/client-app 5m
+NAME                                               USERNAME     AGE   PROGRAMMED
+kongconsumer.configuration.konghq.com/client-app   client-app   5m    True
 ```
 
 ### 2. Verify Authentication Enforcement (Security Check)
@@ -498,10 +505,9 @@ Expected response:
 To remove the Kong AI Gateway deployment and all associated resources:
 
 ```bash
-kubectl delete -f models.yaml -n "$NAMESPACE"
-kubectl delete kongconsumer client-app -n "$NAMESPACE" --ignore-not-found
-kubectl delete secret client-app-key -n "$NAMESPACE" --ignore-not-found
-kubectl delete -f kong-gateway.yaml -n "$NAMESPACE"
+kubectl delete -n "$NAMESPACE" -f models.yaml
+kubectl delete -n "$NAMESPACE" -f kong-gateway.yaml
+kubectl delete -n "$NAMESPACE" secret client-app-key --ignore-not-found
 helm uninstall kong -n "$NAMESPACE"
 kubectl delete namespace "$NAMESPACE"
 ```
