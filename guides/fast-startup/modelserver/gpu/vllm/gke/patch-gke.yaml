@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decode
+spec:
+  replicas: 1
+  template:
+    spec:
+      runtimeClassName: gvisor
+      containers:
+        - name: modelserver
+          image: us-central1-docker.pkg.dev/nxin-gke-dev/vllm/vllm-nccl-snapshot:latest
+          command: ["python3", "-m", "docker.scripts.snapshot.launcher"]
+          args:
+            - "meta-llama/Llama-3.1-8B-Instruct"
+            - "--disable-access-log-for-endpoints=/health,/metrics,/v1/models"
+            - "--tensor-parallel-size=8"
+            - "--gpu-memory-utilization=0.90"
+            - "--max-model-len=8192"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONPATH
+              value: "/opt"
+            - name: SNAPSHOT_PROVIDER
+              value: "gke"
+            - name: SNAPSHOT_CLEAR_CACHE_DIR
+              value: "/root/.cache/huggingface"
+            - name: VLLM_SAFETENSORS_LOAD_STRATEGY
+              value: "eager"
+            - name: VLLM_HOST_IP
+              value: "127.0.0.1"
+            - name: VLLM_LOGGING_LEVEL
+              value: "DEBUG"
+            - name: LD_PRELOAD
+              value: "/usr/local/lib/libnccl-checkpoint-shim.so"
+            - name: NCCL_CHECKPOINT_KVS_PATH
+              value: "/var/run/nccl/kvs.txt"
+          resources:
+            limits:
+              cpu: "32"
+              nvidia.com/gpu: 8
+            requests:
+              cpu: "16"
+              memory: 128Gi
+              nvidia.com/gpu: 8
+          volumeMounts:
+            - mountPath: /opt/docker/scripts/snapshot
+              name: snapshot-scripts
+            - mountPath: /var/run/nccl
+              name: rendezvous-volume
+      volumes:
+        - name: rendezvous-volume
+          emptyDir:
+            medium: Memory
+        - name: snapshot-scripts
+          configMap:
+            name: snapshot-scripts
+            items:
+              - key: launcher.py
+                path: launcher.py
+              - key: providers.py
+                path: providers.py
+              - key: wrapper.py
+                path: vllm/wrapper.py

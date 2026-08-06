@@ -1,0 +1,250 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: snapshot-scripts
+data:
+  launcher.py: |
+    """Entrypoint that starts `vllm serve` with the snapshot hook installed.
+
+    Run as:  python3 -m docker.scripts.snapshot.launcher <vllm serve args...>
+    """
+    import sys
+
+    from vllm.entrypoints.openai import api_server
+
+    from .vllm.wrapper import patch_vllm_lifespan
+
+    _orig_build_app = api_server.build_app
+
+
+    def _build_app(*args, **kwargs):
+        return patch_vllm_lifespan(_orig_build_app(*args, **kwargs))
+
+    api_server.build_app = _build_app
+
+    if __name__ == "__main__":
+        from vllm.entrypoints.cli.main import main
+        from .vllm.wrapper import execute_nccl_re_rendezvous
+
+        # Ensure /var/run/nccl/kvs.txt exists for initial NCCL initialization
+        execute_nccl_re_rendezvous()
+
+        sys.argv = ["vllm", "serve", *sys.argv[1:]]
+        main()
+
+  providers.py: |
+    """
+    Snapshot Providers for GKE Fast Pod Snapshotting.
+    """
+    from __future__ import annotations
+
+    import errno
+    import logging
+    import os
+    import pathlib
+    import shutil
+    from typing import Optional
+    from vllm.logger import init_logger
+
+    logger = init_logger("vllm.snapshot.providers")
+
+    GVISOR_CHECKPOINT_PATH = "/proc/gvisor/checkpoint"
+
+
+    class SnapshotError(RuntimeError):
+        """Raised when container process snapshotting or cache clearing fails."""
+        pass
+
+
+    class GKESnapshotProvider:
+        def __init__(
+            self,
+            proc_path: str = GVISOR_CHECKPOINT_PATH,
+            cache_dir: Optional[str] = None,
+        ) -> None:
+            self.proc_path = proc_path
+            self.cache_dir = cache_dir or os.getenv("SNAPSHOT_CLEAR_CACHE_DIR")
+
+        def is_available(self) -> bool:
+            return os.path.exists(self.proc_path) and os.access(self.proc_path, os.W_OK)
+
+        def clear_cache(self) -> None:
+            if not self.cache_dir:
+                return
+
+            safetensors_strategy = os.getenv("VLLM_SAFETENSORS_LOAD_STRATEGY", "").lower()
+            if safetensors_strategy != "eager":
+                logger.warning(
+                    "Cache clearing is enabled, but VLLM_SAFETENSORS_LOAD_STRATEGY is '%s' (expected 'eager').",
+                    safetensors_strategy or "unset",
+                )
+
+            target_path = pathlib.Path(os.path.expanduser(self.cache_dir))
+            try:
+                if target_path.exists():
+                    logger.info("Clearing specified weight cache path contents: %s", target_path)
+                    if target_path.is_file() or target_path.is_symlink():
+                        target_path.unlink()
+                    else:
+                        for child in target_path.iterdir():
+                            if child.is_file() or child.is_symlink():
+                                child.unlink()
+                            else:
+                                shutil.rmtree(child)
+            except OSError as e:
+                logger.error("Failed to clear weight cache at %s: %s", target_path, e)
+
+        def trigger(self) -> None:
+            if not self.is_available():
+                logger.warning(
+                    "gVisor checkpoint interface '%s' is not available or writable. Skipping snapshot checkpoint.",
+                    self.proc_path,
+                )
+                return
+
+            self.clear_cache()
+
+            try:
+                fd = os.open(self.proc_path, os.O_RDWR)
+            except OSError as e:
+                logger.error("Failed to open gVisor checkpoint file '%s': %s", self.proc_path, e)
+                return
+
+            try:
+                try:
+                    os.write(fd, b"1")
+                except OSError as e:
+                    logger.error("Failed to write to gVisor checkpoint file: %s", e)
+                    return
+
+                try:
+                    res = os.read(fd, 1)
+                except OSError as e:
+                    if e.errno == errno.EINVAL:
+                        logger.error("gVisor snapshot was never initiated: %s", e)
+                    else:
+                        logger.error("gVisor checkpoint failed during restore wait: %s", e)
+                    return
+
+                if res and res not in (b"", b"r", b"e"):
+                    logger.warning("gVisor checkpoint returned unexpected status: %r", res)
+
+                logger.info("gVisor checkpoint completed successfully")
+            finally:
+                os.close(fd)
+
+  wrapper.py: |
+    """
+    vLLM Wrapper Entrypoint for GKE Fast Pod Snapshotting with NCCL Checkpoint Shim support.
+    """
+    import ctypes
+    import os
+    import pathlib
+    import socket
+    import time
+    from contextlib import asynccontextmanager
+    from typing import Optional
+    from vllm.logger import init_logger
+
+    from ..providers import GKESnapshotProvider
+
+    logger = init_logger("vllm.snapshot.wrapper")
+
+
+    def nccl_checkpoint_prepare():
+        """Step B: Pre-Checkpoint Hook to quiesce NCCL communicators via the preloaded shim."""
+        shim_path = os.getenv("LD_PRELOAD", "/usr/local/lib/libnccl-checkpoint-shim.so")
+        if os.path.exists(shim_path):
+            try:
+                shim = ctypes.CDLL(shim_path)
+                if hasattr(shim, "checkpoint_prepare"):
+                    logger.info("Executing NCCL Checkpoint Shim checkpoint_prepare()...")
+                    shim.checkpoint_prepare()
+            except Exception as e:
+                logger.warning("Failed executing NCCL Checkpoint Shim checkpoint_prepare: %s", e)
+
+
+    def execute_nccl_re_rendezvous():
+        """Step C: Write Rank-0 bootstrap endpoint for NCCL Checkpoint Shim and re-initialize."""
+        kvs_path = os.getenv("NCCL_CHECKPOINT_KVS_PATH", "/var/run/nccl/kvs.txt")
+        host_ip = os.getenv("VLLM_HOST_IP", "127.0.0.1")
+        bootstrap_kvs = f"{host_ip}:6379"
+
+        # Write KVS endpoint file for all 8 GPU ranks inside the pod
+        kvs_file = pathlib.Path(kvs_path)
+        kvs_file.parent.mkdir(parents=True, exist_ok=True)
+        kvs_file.write_text(bootstrap_kvs)
+        logger.info("Wrote Rank-0 NCCL bootstrap endpoint '%s' to %s", bootstrap_kvs, kvs_path)
+
+        # Re-initialize NCCL via the preloaded shim
+        shim_path = os.getenv("LD_PRELOAD", "/usr/local/lib/libnccl-checkpoint-shim.so")
+        if os.path.exists(shim_path):
+            try:
+                shim = ctypes.CDLL(shim_path)
+                if hasattr(shim, "checkpoint_restore"):
+                    logger.info("Executing NCCL Checkpoint Shim checkpoint_restore()...")
+                    shim.checkpoint_restore()
+            except Exception as e:
+                logger.warning("Failed executing NCCL Checkpoint Shim checkpoint_restore: %s", e)
+
+
+    def patch_vllm_lifespan(app, snapshot_provider: Optional[GKESnapshotProvider] = None):
+        if snapshot_provider is None:
+            provider_type = os.getenv("SNAPSHOT_PROVIDER", "").lower()
+            if provider_type in ("gke", "gvisor", "gke_gvisor"):
+                snapshot_provider = GKESnapshotProvider()
+            else:
+                logger.info(
+                    "Snapshot provider disabled (SNAPSHOT_PROVIDER='%s'). Lifespan context unmodified.",
+                    provider_type,
+                )
+                return app
+
+        original_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def patched_lifespan(app_inst):
+            async with original_lifespan(app_inst) as state:
+                engine = getattr(app_inst.state, "engine_client", None)
+
+                # Step 1: Release physical VRAM maps
+                if engine and hasattr(engine, "sleep"):
+                    logger.info("Executing engine.sleep(level=1) to release physical VRAM...")
+                    try:
+                        await engine.sleep(level=1)
+                    except Exception as e:
+                        logger.error("Failed to execute engine.sleep(level=1): %s", e)
+                else:
+                    logger.error("Engine client is missing or does not support sleep(level=1).")
+
+                # Step 2: Quiesce NCCL communicators (Pre-Checkpoint Hook)
+                nccl_checkpoint_prepare()
+
+                # Step 3: Trigger Checkpoint
+                logger.info("Triggering snapshot checkpoint...")
+                try:
+                    snapshot_provider.trigger()
+                except Exception as e:
+                    logger.error("Failed to trigger snapshot checkpoint: %s", e)
+
+                # --- PROCESS RESTORED ---
+                logger.info("Process restored from snapshot checkpoint. Resuming engine...")
+
+                # Step 4: Re-Rendezvous IP & Re-initialize NCCL (Post-Restore Hook)
+                execute_nccl_re_rendezvous()
+
+                # Step 5: Re-allocate physical VRAM maps
+                if engine and hasattr(engine, "wake_up"):
+                    logger.info("Executing engine.wake_up() to restore VRAM...")
+                    try:
+                        await engine.wake_up()
+                    except Exception as e:
+                        logger.error("Failed to execute engine.wake_up(): %s", e)
+                else:
+                    logger.error("Engine client is missing or does not support wake_up().")
+
+                yield state
+
+        app.router.lifespan_context = patched_lifespan
+        logger.info("Successfully patched vLLM FastAPI lifespan context for GKE snapshotting with NCCL Checkpoint Shim.")
+        return app

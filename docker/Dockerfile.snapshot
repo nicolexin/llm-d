@@ -1,0 +1,47 @@
+ARG BASE_IMAGE=vllm/vllm-openai:v0.19.1
+
+# Multi-stage build to compile NVIDIA NCCL Checkpoint Shim
+FROM ${BASE_IMAGE} AS nccl-shim-builder
+
+USER 0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    cmake \
+    libhiredis-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone NCCL repository to compile contrib/nccl_checkpoint shim
+RUN git clone --depth 1 https://github.com/NVIDIA/nccl.git /tmp/nccl && \
+    cd /tmp/nccl/contrib/nccl_checkpoint && \
+    (make || true) && \
+    find . -name "*.so" -exec cp {} /tmp/libnccl-checkpoint-shim.so \;
+
+# Final runtime image
+FROM ${BASE_IMAGE}
+
+USER 0
+
+# Copy compiled NCCL Checkpoint Shim library
+COPY --from=nccl-shim-builder /tmp/libnccl-checkpoint-shim.so /usr/local/lib/libnccl-checkpoint-shim.so
+
+# Copy snapshot provider and wrapper entrypoint into workspace
+COPY docker/scripts/snapshot /opt/vllm-source/docker/scripts/snapshot
+
+# Ensure snapshot package is accessible in Python module search path
+ENV PYTHONPATH="/opt/vllm-source:${PYTHONPATH}"
+
+# Default snapshot environment configuration including NCCL Checkpoint Shim preload
+ENV SNAPSHOT_PROVIDER="gke" \
+    VLLM_SAFETENSORS_LOAD_STRATEGY="eager" \
+    LD_PRELOAD="/usr/local/lib/libnccl-checkpoint-shim.so" \
+    NCCL_CHECKPOINT_KVS_PATH="/var/run/nccl/kvs.txt" \
+    NCC_SHARED_RENDEZVOUS_DIR="/var/run/nccl"
+
+USER 0
+WORKDIR /root
+
+# Entrypoint wraps vLLM OpenAI API server with GKE snapshot lifespan patching
+ENTRYPOINT ["python3", "-m", "docker.scripts.snapshot.launcher"]
+
+
