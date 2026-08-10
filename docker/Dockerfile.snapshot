@@ -1,47 +1,165 @@
 ARG BASE_IMAGE=vllm/vllm-openai:v0.19.1
 
-# Multi-stage build to compile NVIDIA NCCL Checkpoint Shim
+# NCCL release that both the checkpoint shim and the runtime library come from.
+# contrib/nccl_checkpoint first shipped in 2.30.7 -- it is absent from 2.29.7 and
+# earlier -- and upstream recommends the shim be built against exactly the NCCL it
+# runs against, so a single version pins both sides.
+ARG NCCL_WHEEL_VERSION=2.30.7
+ARG NCCL_REF=v2.30.7-1
+
+# Stable path for the runtime NCCL. The real file lives inside the pip wheel, whose
+# location depends on the interpreter version; a symlink keeps LD_PRELOAD and
+# VLLM_NCCL_SO_PATH readable. Deliberately not under a default loader directory, so
+# it cannot compete with the base image's apt libnccl for bare-soname lookups.
+ARG NCCL_SO=/opt/nccl/libnccl.so.2
+
+# ---------------------------------------------------------------------------
+# Stage 1: build the NCCL checkpoint shim
+# ---------------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS nccl-shim-builder
+ARG NCCL_REF
+ARG NCCL_WHEEL_VERSION
 
 USER 0
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
-    cmake \
+    pkg-config \
     libhiredis-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone NCCL repository to compile contrib/nccl_checkpoint shim
-RUN git clone --depth 1 https://github.com/NVIDIA/nccl.git /tmp/nccl && \
-    cd /tmp/nccl/contrib/nccl_checkpoint && \
-    (make || true) && \
-    find . -name "*.so" -exec cp {} /tmp/libnccl-checkpoint-shim.so \;
+# The shim's Makefile resolves hiredis with `pkg-config --libs hiredis 2>/dev/null`
+# and links nothing at all when that fails. Without pkg-config installed the shim
+# still builds -- `cc -shared` does not error on undefined symbols -- and ships with
+# unresolved redisConnectWithTimeout/redisCommand/redisCommandArgv/redisFree.
+# Fail here instead.
+RUN pkg-config --exists hiredis && pkg-config --modversion hiredis
 
-# Final runtime image
+RUN git clone --depth 1 --branch ${NCCL_REF} https://github.com/NVIDIA/nccl.git /opt/nccl-src
+
+# Local fixes to contrib/nccl_checkpoint. `git apply` fails on a mismatch, so these
+# turn into a build failure the moment NCCL_REF moves past them. Drop a patch here
+# once the corresponding fix lands upstream. See docker/patches/README.md.
+COPY docker/patches /opt/nccl-patches
+RUN set -eu; \
+    for p in /opt/nccl-patches/*.patch; do \
+        echo "applying $(basename "$p")"; \
+        git -C /opt/nccl-src apply --verbose "$p"; \
+    done
+
+# NCCL_REF and NCCL_WHEEL_VERSION are two pins that must name the same release: the
+# shim generates its interposers from the headers it is built against, so a mismatch
+# here is a shim that compiles cleanly and then misbehaves against the runtime
+# library. Make drifting them a build failure rather than a runtime mystery.
+RUN set -eu; \
+    src_ver="$(awk -F':= *' '/^NCCL_(MAJOR|MINOR|PATCH)/ {printf "%s%s", sep, $2; sep="."}' \
+                   /opt/nccl-src/makefiles/version.mk)"; \
+    test "$src_ver" = "${NCCL_WHEEL_VERSION}" \
+        || { echo "FATAL: shim source ${NCCL_REF} is NCCL $src_ver but NCCL_WHEEL_VERSION is ${NCCL_WHEEL_VERSION}" >&2; exit 1; }; \
+    echo "shim source and wheel pin agree: NCCL $src_ver"
+
+# Build the shim and the KV sanity binary. kv_sanity_test is named by `all` but does
+# not reliably get built by it, so ask for it by absolute path -- it is the only
+# artifact here that links hiredis into an *executable*, which is a stricter link than
+# the shared object gets.
+WORKDIR /opt/nccl-src/contrib/nccl_checkpoint
+RUN make -j"$(nproc)" \
+    && make "$(pwd)/build/bin/kv_sanity_test" \
+    && make install PREFIX=/opt/nccl-checkpoint \
+    && ls -l build/lib build/bin
+
+# Post-link gates. Everything above can succeed and still produce a shim that dies on
+# first use, so assert the properties that actually matter.
+#
+# Check DT_NEEDED, not the undefined-symbol list. A shared object that correctly links
+# libhiredis.so still reports `U redisCommand` from `nm -D --undefined-only` -- that is
+# just how dynamic linking works, the symbol is resolved at load time from the
+# dependency. The real signature of the broken build is an *absent* NEEDED entry.
+RUN set -eu; \
+    so=/opt/nccl-checkpoint/lib/libnccl-checkpoint-shim.so; \
+    echo "--- readelf -d ---"; readelf -d "$so"; \
+    echo "--- undefined redis symbols (expected: present, resolved via NEEDED) ---"; \
+    nm -D --undefined-only "$so" | grep ' redis' || true; \
+    readelf -d "$so" | grep -q 'NEEDED.*libhiredis' \
+        || { echo "FATAL: shim is not linked against libhiredis -- pkg-config did not find it at link time" >&2; exit 1; }; \
+    for sym in ncclCheckpointPrepare ncclCheckpointRestore ncclCheckpointGetVersion; do \
+        nm -D --defined-only "$so" | grep -q " $sym\$" \
+            || { echo "FATAL: shim does not export $sym" >&2; exit 1; }; \
+    done; \
+    echo "shim OK: libhiredis in DT_NEEDED, checkpoint entry points exported"
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime
+# ---------------------------------------------------------------------------
 FROM ${BASE_IMAGE}
+ARG NCCL_WHEEL_VERSION
+ARG NCCL_SO
 
 USER 0
 
-# Copy compiled NCCL Checkpoint Shim library
-COPY --from=nccl-shim-builder /tmp/libnccl-checkpoint-shim.so /usr/local/lib/libnccl-checkpoint-shim.so
+# hiredis for the shim's KV store client, redis-server for the rendezvous KVS it
+# talks to. The KVS is scratch space for a single re-rendezvous and is started by the
+# launcher only after the snapshot restores -- see docker/scripts/snapshot/vllm/wrapper.py.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libhiredis-dev \
+    redis-server \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy snapshot provider and wrapper entrypoint into workspace
+# Replace the NCCL the base image ships. torch pulls in nvidia-nccl-cu12 2.27.5,
+# which predates ncclCommGrow() and ncclCommGetUniqueId() -- both called directly by
+# shim_checkpoint.cc, so the shim cannot restore a communicator against it. The base
+# image also carries an apt libnccl2, but only as an unpinned dependency of
+# libnccl-dev, which vLLM installs just to get nccl.h; pinning the wheel keeps the
+# version under our control instead.
+#
+# This also fixes up the headers for free: vLLM's find_nccl_include_paths() discovers
+# nccl.h from the nvidia.nccl package, so pynccl_allocator JIT-compiles against the
+# same version it links against.
+RUN python3 -m pip install --no-deps --no-cache-dir nvidia-nccl-cu12==${NCCL_WHEEL_VERSION}
+
+RUN set -eu; \
+    wheel_so="$(python3 -c 'import importlib.util, pathlib; \
+loc = next(iter(importlib.util.find_spec("nvidia.nccl").submodule_search_locations)); \
+print(pathlib.Path(loc) / "lib" / "libnccl.so.2")')"; \
+    test -e "$wheel_so" || { echo "FATAL: no libnccl.so.2 in the nvidia-nccl-cu12 wheel" >&2; exit 1; }; \
+    mkdir -p "$(dirname "${NCCL_SO}")"; \
+    ln -sf "$wheel_so" "${NCCL_SO}"
+
+# Prove the LD_PRELOAD target loads and is the version the shim was built against.
+# A mismatch here means silent breakage at the first collective.
+RUN python3 -c "import ctypes, os; \
+p = os.environ['NCCL_SO']; \
+v = ctypes.c_int(); \
+assert ctypes.CDLL(p).ncclGetVersion(ctypes.byref(v)) == 0, 'ncclGetVersion failed'; \
+got = '%d.%d.%d' % (v.value // 10000, v.value // 100 % 100, v.value % 100); \
+print('runtime NCCL', got, '->', os.path.realpath(p)); \
+assert got == os.environ['NCCL_WHEEL_VERSION'], 'expected %s, got %s' % (os.environ['NCCL_WHEEL_VERSION'], got)"
+
+COPY --from=nccl-shim-builder /opt/nccl-checkpoint/lib/libnccl-checkpoint-shim.so /usr/local/lib/
+COPY --from=nccl-shim-builder /opt/nccl-checkpoint/include/nccl_checkpoint.h /usr/local/include/
+COPY --from=nccl-shim-builder /opt/nccl-src/contrib/nccl_checkpoint/build/bin/kv_sanity_test /usr/local/bin/
+RUN ldconfig
+
 COPY docker/scripts/snapshot /opt/vllm-source/docker/scripts/snapshot
 
-# Ensure snapshot package is accessible in Python module search path
-ENV PYTHONPATH="/opt/vllm-source:${PYTHONPATH}"
-
-# Default snapshot environment configuration including NCCL Checkpoint Shim preload
-ENV SNAPSHOT_PROVIDER="gke" \
-    VLLM_SAFETENSORS_LOAD_STRATEGY="eager" \
-    LD_PRELOAD="/usr/local/lib/libnccl-checkpoint-shim.so" \
-    NCCL_CHECKPOINT_KVS_PATH="/var/run/nccl/kvs.txt" \
-    NCC_SHARED_RENDEZVOUS_DIR="/var/run/nccl"
-
-USER 0
 WORKDIR /root
 
-# Entrypoint wraps vLLM OpenAI API server with GKE snapshot lifespan patching
+# Set LD_PRELOAD last: it applies to every process in the image, and preloading NCCL
+# into apt/pip/dpkg during a build step is a good way to break the build.
+#
+# Order matters. The shim interposes the NCCL API and forwards to the real
+# implementation with dlsym(RTLD_NEXT), which searches only objects loaded after the
+# caller in the *global* scope. Upstream's Makefile deliberately omits -lnccl because
+# it expects the application to have put NCCL there. vLLM instead loads it with
+# ctypes.CDLL (RTLD_LOCAL) and torch dlopens its copy under an extension module, so
+# without the second entry RTLD_NEXT finds nothing and every forwarded call fails.
+# Preloading NCCL also claims the libnccl.so.2 soname before torch can, which
+# guarantees exactly one NCCL is mapped into the process.
+ENV PYTHONPATH="/opt/vllm-source:${PYTHONPATH}" \
+    SNAPSHOT_PROVIDER="gke" \
+    LD_PRELOAD="/usr/local/lib/libnccl-checkpoint-shim.so:${NCCL_SO}" \
+    VLLM_NCCL_SO_PATH="${NCCL_SO}" \
+    NCCL_CHECKPOINT_KVS_PATH="/var/run/nccl/kvs.txt" \
+    NCCL_CHECKPOINT_KVS_ADDR="127.0.0.1:6379"
+
 ENTRYPOINT ["python3", "-m", "docker.scripts.snapshot.launcher"]
-
-

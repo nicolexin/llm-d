@@ -8,10 +8,11 @@ and clearing model weight caches when configured.
 from __future__ import annotations
 
 import errno
-import logging
 import os
 import pathlib
 import shutil
+from typing import Optional
+
 from vllm.logger import init_logger
 
 logger = init_logger("vllm.snapshot.providers")
@@ -44,18 +45,16 @@ class GKESnapshotProvider:
         return os.path.exists(self.proc_path) and os.access(self.proc_path, os.W_OK)
 
     def clear_cache(self) -> None:
-        """Clear out cached model weights if an explicit cache directory is configured."""
+        """Clear out cached model weights if an explicit cache directory is configured.
+
+        Requires vLLM to have been started with `--safetensors-load-strategy eager`.
+        The default strategy memory-maps the weight files, so vLLM still holds
+        mappings into them and deleting the cache would leave the snapshot pointing
+        at files that no longer exist.
+        """
         if not self.cache_dir:
             logger.debug("No cache directory specified to clear (SNAPSHOT_CLEAR_CACHE_DIR unset).")
             return
-
-        safetensors_strategy = os.getenv("VLLM_SAFETENSORS_LOAD_STRATEGY", "").lower()
-        if safetensors_strategy != "eager":
-            logger.warning(
-                "Cache clearing is enabled, but VLLM_SAFETENSORS_LOAD_STRATEGY is '%s' (expected 'eager'). "
-                "Non-eager loading may cause vLLM to hold file descriptors to model weight files.",
-                safetensors_strategy or "unset",
-            )
 
         target_path = pathlib.Path(os.path.expanduser(self.cache_dir))
         try:

@@ -39,7 +39,102 @@ To learn more about how GKE Image Streaming functions under the hood, refer to t
 
 Before proceeding, review the official [GKE Pod Snapshots Requirements and Limitations](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/pod-snapshots#limitations) and [GKE Image Streaming Requirements](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/image-streaming#requirements) for up-to-date details on supported machine types and other requirements.
 
-**Note:** The GKE Pod Snapshots feature has been only validated on single host deployments with NVIDIA L4 GPUs. Multi-host deployment is currently not tested.
+**Note:** The GKE Pod Snapshots feature has been only validated on single host deployments with NVIDIA L4 GPUs. Single-GPU is the supported path. Multi-GPU (tensor parallel) is **experimental** — see below. Multi-node is **out of scope**: nothing in this guide has been designed or tested for ranks that span pods.
+
+### Multi-GPU (tensor parallel) snapshots — experimental
+
+> [!IMPORTANT]
+> This path works on 8× L4 at TP=8 and is documented so it can be reproduced, but it
+> depends on an unreleased NVIDIA component and on behaviour that upstream does not
+> guarantee. Treat it as a testbed, not a serving recommendation. **Multi-node is out of
+> scope** — NCCL caches a host identity that the snapshot freezes, so ranks spanning pods
+> is not something this configuration supports.
+
+A single-GPU pod needs nothing beyond what is described above. Tensor parallelism adds
+live NCCL communicators, which cannot be frozen and thawed — they have to be destroyed
+before the checkpoint and rebuilt after the restore. NVIDIA's **NCCL checkpoint shim** does
+that: an `LD_PRELOAD` interposer adding `ncclCheckpointPrepare()` and
+`ncclCheckpointRestore()`. `docker/Dockerfile.snapshot` builds it, `docker/scripts/snapshot/`
+drives it. Three constraints come with it:
+
+* **NCCL 2.30.7 or newer, built from source.** `contrib/nccl_checkpoint` first shipped in
+  the `v2.30.7-1` tag and is not distributed as a package, so the Dockerfile clones and
+  compiles it. Shim source and runtime NCCL must be the same version: `NCCL_REF` (the tag
+  compiled from) and `NCCL_WHEEL_VERSION` (the `nvidia-nccl-cu12` wheel) are two pins that
+  can drift, so the build parses `nccl.h` and fails on mismatch. Local fixes live in
+  `docker/patches/` — see `docker/patches/README.md`.
+
+* **`LD_PRELOAD` ordering is load-bearing.** Shim *first*, real `libnccl.so.2` *second*.
+  The shim forwards via `dlsym(RTLD_NEXT, ...)`, which searches only the global scope, and
+  vLLM loads NCCL with `ctypes.CDLL` (`RTLD_LOCAL`). Without the second entry the first
+  collective dies with a bare `NCCL error: internal error`.
+
+* **CUDA graphs are documented as unsupported**, so the deployment passes
+  `--enforce-eager`. Removing the flag did not actually reproduce a failure here — a
+  restore onto a different node returned byte-identical output with graphs captured — but
+  one passing configuration does not overrule an explicit upstream limitation, the failure
+  mode would be silent corruption, and the flag is free on L4. See the comment in
+  `patch-gke.yaml` for the measurements.
+
+Restore also needs a key-value store: `ncclCheckpointRestore()` has rank 0 publish fresh
+`ncclUniqueId`s and the other ranks read them back. Upstream's client speaks RESP with no
+file-backed mode, so the image ships `redis-server`, started as a short-lived child process
+*after* the restore — keeping a bound TCP socket out of the snapshot.
+
+#### What the multi-GPU deployment sets, and why
+
+Each of these was tested by removing it and observing the result, on 8× L4 at TP=8
+with `meta-llama/Llama-3.1-8B-Instruct`. Two settings that were originally assumed
+necessary turned out not to be.
+
+| Setting | Required? | What happens without it |
+| :--- | :--- | :--- |
+| image pinned by **digest** | yes | Restores a snapshot taken from different bytes; `undefined symbol: ncclCheckpointRestore`, then SIGSEGV |
+| `NCCL_SOCKET_IFNAME=lo` | yes | NCCL records eth0's address at init; every rank fails on restore with `ncclSocketListen → bind failed: Cannot assign requested address` |
+| `NCCL_SHM_DISABLE=1` | yes | **Hangs.** All 8 ranks enter `ncclCheckpointRestore()` and none return |
+| `--enable-sleep-mode` | yes | `sleep(level=1)` becomes a silent no-op — `CuMemAllocator: sleep freed 0.00 GiB` — and ~20 GiB/rank of VRAM lands in the snapshot |
+| `--safetensors-load-strategy=eager` | yes | Weights stay mmapped, so clearing the cache dir leaves dangling mappings in the snapshot |
+| `--worker-extension-cls` hooks | yes | Communicators live in the 8 workers, not the API server; calling the hooks from the lifespan alone silently does nothing |
+| `--enforce-eager` | precaution | Tested working when removed, including a byte-identical cross-node restore; kept because upstream documents the limitation and the failure mode would be silent |
+| `--disable-custom-all-reduce` | precaution | No-op on L4 — vLLM self-disables custom all-reduce for >2 PCIe-only GPUs. Kept for NVLink hardware, where it opens CUDA IPC handles that `cuda-checkpoint` refuses to run alongside. **Not tested** — no NVLink in the test cluster |
+| `NCCL_P2P_DISABLE` | **no** | Nothing. Confirmed unnecessary and deliberately not set — disabling P2P as well would leave TCP-over-loopback for every collective |
+
+The `NCCL_SHM_DISABLE` failure does not look like an error: all 8 ranks enter
+`ncclCheckpointRestore()` and none return. NCCL never errors and the 300s
+`NCCL_CHECKPOINT_KVS_TIMEOUT` never fires, so the ranks *did* rendezvous through Redis —
+it is a deadlock re-establishing the shared-memory transport inside a restored gVisor
+sandbox. Only the wrapper's own RPC timeout breaks it, seven minutes later, and the pod
+then cold-starts.
+
+> [!WARNING]
+> **Container environment variables are not part of the snapshot compatibility key.**
+> Measured: flipping one env var left `pod-template-hash` unchanged, so an existing
+> snapshot stays valid and the pod restores with the *old* environment frozen into memory.
+> `kubectl exec` hides this, because the new process inherits the new environment — read
+> `/proc/1/environ` instead.
+>
+> For the same reason, check `restartCount` and `Started (xN)` before believing a restore
+> succeeded. A pod that silently fell back to a cold start still reaches `1/1 Running`.
+
+#### Performance caveat at TP=8
+
+TP=8 on L4 is communication-bound, not compute-bound: roughly **4.3 tokens/sec** for an
+8B model, because every decode step pays a PCIe all-reduce across 8 GPUs with no NVLink.
+The effect swamps everything else — CUDA graphs and `--enforce-eager` benchmarked
+identically (47.0s vs 47.1s for 200 tokens).
+
+Note also that the 2-replica → 3-replica scale-out walkthrough below assumes the
+single-GPU deployment. At TP=8 each replica consumes an entire 8-GPU node, so the
+replica count is capped by node count — the GKE overlay ships `replicas: 1` for that
+reason.
+
+The GKE overlay mounts `docker/scripts/snapshot/` from a ConfigMap so the sequencing
+can be iterated on without rebuilding the image. **After editing anything under
+`docker/scripts/snapshot/`, regenerate it:**
+
+```bash
+guides/fast-startup/hack/sync-configmap.sh
+```
 
 ---
 
@@ -271,6 +366,31 @@ curl -X POST http://${IP}/v1/completions \
 ```
 
 Verify that you receive a valid JSON response containing the generated text from the model.
+
+### 3. Verify the Restore Itself
+
+A valid JSON response is not proof that a restore worked — a pod that silently cold-started
+serves valid JSON too. Confirm `PodRestored` is `True` and `restartCount` is `0`:
+
+```bash
+kubectl get pod ${POD} -n ${NAMESPACE} \
+    -o jsonpath='{.status.conditions[?(@.type=="PodRestored")].status}{" restarts="}{.status.containerStatuses[0].restartCount}{"\n"}'
+```
+
+To check that a snapshot crossed machines, compare the restored pod's `.spec.nodeName`
+against the snapshot's own origin — not the pod's previous node, which is a different
+thing:
+
+```bash
+kubectl get podsnapshot ${SNAPSHOT} -n ${NAMESPACE} \
+    -o jsonpath='{.metadata.annotations.podsnapshot\.gke\.io/origin-node}{"\n"}'
+```
+
+At TP=8, also confirm every rank came back (`kubectl logs ${POD} | grep -c
+"ncclCheckpointRestore() done"` should print 8), and check correctness by comparing greedy
+completions (`temperature=0`, `seed=0`) byte-for-byte against the source pod — a damaged
+all-reduce produces fluent-but-wrong text, not an error. Discard one request from each pod
+first: the first request any pod serves differs from every later one, snapshot or not.
 
 ---
 

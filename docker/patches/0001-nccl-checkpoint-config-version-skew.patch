@@ -1,0 +1,57 @@
+--- a/contrib/nccl_checkpoint/shim.cc
++++ b/contrib/nccl_checkpoint/shim.cc
+@@ -1,7 +1,9 @@
+ #include <nccl.h>
+ #include "shim_core.h"
+ #include <dlfcn.h>
++#include <cstddef>
+ #include <cstdio>
++#include <cstring>
+ #include <vector>
+ 
+ using namespace nccl_checkpoint;
+@@ -26,13 +28,39 @@
+   params->net_name[0] = '\0';
+   params->comm_name[0] = '\0';
+   if (configPtr) {
+-    params->config = *configPtr;
+-    if (configPtr->netName) {
+-      strncpy(params->net_name, configPtr->netName, sizeof(params->net_name) - 1);
++    // Start from this NCCL's defaults and overlay only the bytes the caller owns.
++    //
++    // ncclConfig_t is versioned by its leading `size` field so that a caller
++    // compiled against an older nccl.h can pass a shorter struct. vLLM and
++    // PyTorch both do: the wheel they were built against predates this one, and
++    // their NCCL_CONFIG_INITIALIZER only covers the fields that existed then.
++    // Copying sizeof(ncclConfig_t) bytes reads past the caller's object and
++    // leaves every field added since their header uninitialized -- and the
++    // assignments just below stamp size/magic/version to the current release,
++    // which tells parseCommConfig() to validate those fields anyway. It rejects
++    // the first one it reaches:
++    //
++    //   NCCL WARN Invalid config nChannelsPerNetPeer attribute value 0
++    //
++    // so ncclCheckpointRestore() returns ncclInvalidArgument on every rank.
++    params->config = NCCL_CONFIG_INITIALIZER;
++    size_t callerSize = configPtr->size;
++    if (callerSize > sizeof(ncclConfig_t)) {
++      // Caller is newer than we are. Take what we understand and ignore the rest.
++      callerSize = sizeof(ncclConfig_t);
+     }
+-    if (configPtr->commName) {
+-      strncpy(params->comm_name, configPtr->commName, sizeof(params->comm_name) - 1);
++    if (callerSize >= offsetof(ncclConfig_t, blocking)) {
++      memcpy(&params->config, configPtr, callerSize);
++    }
++    // Read the names back out of our own copy rather than the caller's struct:
++    // if callerSize stopped short of these fields they are our defaults (null),
++    // and dereferencing configPtr there would be the same overread again.
++    if (params->config.netName) {
++      strncpy(params->net_name, params->config.netName, sizeof(params->net_name) - 1);
+     }
++    if (params->config.commName) {
++      strncpy(params->comm_name, params->config.commName, sizeof(params->comm_name) - 1);
++    }
+   } else {
+     params->config = NCCL_CONFIG_INITIALIZER;
+   }

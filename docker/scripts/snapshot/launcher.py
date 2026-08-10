@@ -30,10 +30,20 @@ api_server.build_app = _build_app
 
 if __name__ == "__main__":
     from vllm.entrypoints.cli.main import main
-    from .vllm.wrapper import execute_nccl_re_rendezvous
 
-    # Ensure /var/run/nccl/kvs.txt exists for initial NCCL initialization
-    execute_nccl_re_rendezvous()
+    from .vllm.wrapper import WORKER_EXTENSION_CLS, write_kvs_file
 
-    sys.argv = ["vllm", "serve", *sys.argv[1:]]
+    argv = list(sys.argv[1:])
+
+    # The checkpoint hooks have to run in the worker processes -- they, not the API
+    # server, own the NCCL communicators. See vllm/worker.py.
+    if not any(a.split("=", 1)[0] == "--worker-extension-cls" for a in argv):
+        argv.append(f"--worker-extension-cls={WORKER_EXTENSION_CLS}")
+
+    # Publish the rendezvous endpoint up front so the file is in place no matter
+    # when the shim reads it. The KV store itself is not started until after the
+    # snapshot restores.
+    write_kvs_file()
+
+    sys.argv = ["vllm", "serve", *argv]
     main()

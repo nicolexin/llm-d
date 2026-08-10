@@ -9,7 +9,13 @@ spec:
       runtimeClassName: gvisor
       containers:
         - name: modelserver
-          image: us-central1-docker.pkg.dev/nxin-gke-dev/vllm/vllm-nccl-snapshot:latest
+          # Pin by digest, not by tag. GKE keys a PodSnapshot to a hash of the pod
+          # template, so a mutable tag hashes the same before and after a rebuild and
+          # a pod will happily restore a snapshot taken from different bytes. The
+          # thawed process then has libnccl-checkpoint-shim.so remapped from a file
+          # that is no longer the one it froze with, which shows up as
+          # "undefined symbol: ncclCheckpointRestore" followed by SIGSEGV.
+          image: us-central1-docker.pkg.dev/nxin-gke-dev/vllm/vllm-nccl-snapshot@sha256:fd96db564482a51e3736d6d3f49f96bf3fb6e9f3d91843a913086ae5686468f6
           command: ["python3", "-m", "docker.scripts.snapshot.launcher"]
           args:
             - "meta-llama/Llama-3.1-8B-Instruct"
@@ -17,25 +23,176 @@ spec:
             - "--tensor-parallel-size=8"
             - "--gpu-memory-utilization=0.90"
             - "--max-model-len=8192"
+            # Disable CUDA graphs. Kept as the default here, but read the whole comment
+            # before deciding -- this one did NOT behave the way the docs predict.
+            #
+            # Upstream lists it under Limitations: "CUDA graph capture is not supported",
+            # to be addressed in a coming release. The mechanism you would expect: a
+            # captured graph stores its kernel arguments as literal addresses -- that is
+            # the whole optimization. cuda-checkpoint restores memory at the same
+            # addresses, so a graph survives that part fine. What should break it is the
+            # shim, which cannot suspend a communicator in place and so destroys it and
+            # builds a new one. Replaying the graph would then re-issue frozen launches
+            # against the old addresses. Nothing would catch it either: a graph replay
+            # makes no NCCL call, so the shim has no interposition point, and it does not
+            # mark graph-capturing comms restore-unsafe the way it does for the device API.
+            #
+            # Tested with the flag removed, and none of that happened. vLLM captured 51
+            # PIECEWISE + 35 FULL graphs (1.24 GiB/rank, 44s of warmup) with pynccl
+            # enabled, so the TP all-reduces really were inside them. Then:
+            #
+            #   - checkpoint and restore reported success on all 8 ranks
+            #   - zero graph-related output from vLLM or NCCL, at NCCL_DEBUG=WARN
+            #   - a pod restored onto a DIFFERENT node returned output byte-identical to
+            #     the source pod across 200 greedy tokens (min_tokens=200, temperature=0,
+            #     seed=0), verified by sha, not by reading the answer
+            #
+            # Two traps in reproducing that. Graphs-on and enforce-eager produce different
+            # warm output FROM EACH OTHER -- different kernels, so a different FP reduction
+            # order -- so each run needs a baseline from its own config. And the first
+            # request any pod serves differs from every later one, snapshot or not; warm
+            # both sides with a discarded request or you will diagnose corruption that
+            # is not there.
+            #
+            # The likely reason it survives: the restored process re-creates NCCL's device
+            # buffers through the same allocation sequence, so they land back at the same
+            # addresses and the frozen kernel arguments still point at valid memory. That
+            # is address-reuse determinism, not a guarantee -- a different model, topology
+            # or NCCL version could reorder those allocations and the failure would be
+            # silent corruption. One passing configuration is not enough to overrule an
+            # explicit upstream limitation.
+            #
+            # What keeping it costs here: nothing measurable. Same prompt, 200 tokens,
+            # min_tokens=200, temperature 0, three runs on a restored pod:
+            #
+            #   CUDA graphs   47008 / 47706 / 46334 ms   (mean 47.0 s)
+            #   enforce-eager 49158 / 45907 / 46130 ms   (mean 47.1 s)
+            #
+            # At TP=8 on L4 the per-token PCIe all-reduce dominates decode so completely
+            # that graph launch overhead is lost in the noise. That is a property of this
+            # topology, not of the flag -- on NVLink parts the trade is real, and worth
+            # measuring rather than assuming.
+            - "--enforce-eager"
+            # Required for wrapper.py's engine.sleep(level=1) to actually do anything.
+            # It does not fail loudly without this -- tested, and the failure is silent:
+            #
+            #   Snapshot 1/5: engine.sleep(level=1)
+            #   cumem.py:216] CuMemAllocator: sleep freed 0.00 GiB memory in total, of
+            #   which 0.00 GiB is backed up in CPU and the rest 0.00 GiB is discarded
+            #
+            # on every rank, and then the checkpoint proceeds and succeeds. sleep() needs
+            # weights allocated through CuMemAllocator's releasable pool, and this flag is
+            # what puts them there; without it there is nothing registered to release, so
+            # the call is a no-op and ~20 GiB per rank of VRAM lands in the snapshot.
+            #
+            # Note the neighbouring "Sleep mode freed 0.54 GiB" line from gpu_worker.py is
+            # torch emptying its cache, not sleep working. Read the cumem.py line instead.
+            - "--enable-sleep-mode"
+            # Unrelated to --enforce-eager above, despite the shared word. That one is
+            # eager *execution*; this is eager *loading* -- read weights into RAM instead
+            # of mmapping them, so SNAPSHOT_CLEAR_CACHE_DIR can delete the cache without
+            # leaving dangling mappings in the snapshot.
+            - "--safetensors-load-strategy=eager"
+            # On L4 this flag does nothing except silence a warning, and it is kept only
+            # for readers running this guide on NVLink hardware. Tested: with the flag
+            # removed, all 8 workers log
+            #
+            #   custom_all_reduce.py:154] Custom allreduce is disabled because it's not
+            #   supported on more than two PCIe-only GPUs. To silence this warning,
+            #   specify disable_custom_all_reduce=True explicitly.
+            #
+            # and the checkpoint succeeds anyway. CustomAllreduce.__init__ bails when
+            # world_size > 2 and the GPUs are not fully NVLink-connected, which is every
+            # L4 topology.
+            #
+            # Why keep it. On NVLink parts (A100/H100/H200/B200) custom all-reduce does
+            # initialize, and it opens CUDA IPC handles across all ranks. cuda-checkpoint
+            # refuses to run while a process holds CUDA IPC mappings, since they point
+            # into other processes' address spaces. NCCL's P2P transport uses IPC too, but
+            # that one is fine: ncclCheckpointPrepare tears it down and
+            # ncclCheckpointRestore rebuilds it. Nothing does that for vLLM's, because
+            # those handles belong to vLLM's own extension and the shim never sees them.
+            #
+            # That reasoning is inferred, NOT tested -- there is no NVLink in this cluster,
+            # so the flag has never actually been exercised. Treat it as a precaution.
+            # Making it unnecessary would need a vLLM-side fix: close CustomAllreduce
+            # before the checkpoint and rebuild it after restore, via the worker extension.
+            - "--disable-custom-all-reduce"
+            # --worker-extension-cls is injected by launcher.py; the checkpoint hooks
+            # must run in the worker processes, which are the only ones that hold
+            # NCCL communicators.
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+            # Overrides the image's PYTHONPATH so the ConfigMap mount below wins over
+            # the copy baked into /opt/vllm-source. Drop this to run the baked-in code.
             - name: PYTHONPATH
               value: "/opt"
             - name: SNAPSHOT_PROVIDER
               value: "gke"
             - name: SNAPSHOT_CLEAR_CACHE_DIR
               value: "/root/.cache/huggingface"
-            - name: VLLM_SAFETENSORS_LOAD_STRATEGY
-              value: "eager"
             - name: VLLM_HOST_IP
               value: "127.0.0.1"
-            - name: VLLM_LOGGING_LEVEL
-              value: "DEBUG"
-            - name: LD_PRELOAD
-              value: "/usr/local/lib/libnccl-checkpoint-shim.so"
+            # Pin NCCL's bootstrap socket to loopback. All 8 ranks live in this pod,
+            # so nothing NCCL binds needs to be reachable from outside it -- and the
+            # pod IP is the one thing that does NOT survive a snapshot. Left to pick
+            # its own interface, NCCL records eth0's address at init, and a pod
+            # restored onto a new IP fails every rank at
+            #   misc/socket.cc:137 (ncclSocketListen)
+            #   NCCL WARN Call to bind failed: Cannot assign requested address
+            # 127.0.0.1 is identical in every sandbox, so the saved address stays valid.
+            - name: NCCL_SOCKET_IFNAME
+              value: "lo"
+            # Disable NCCL's shared-memory transport. Required, and the failure mode is a
+            # hang rather than an error, so it is worth knowing exactly what it looks like.
+            #
+            # With SHM left enabled, all 8 ranks enter ncclCheckpointRestore() and none
+            # of them ever return:
+            #
+            #   23:19:45  gVisor checkpoint completed successfully
+            #   23:19:45  Rank 0-7: ncclCheckpointRestore()      <- all 8 enter
+            #   23:26:45  RPC call to nccl_checkpoint_restore timed out
+            #   23:26:45  Application startup failed. Exiting.   <- restart, cold start
+            #
+            # Note what does NOT happen: NCCL never errors, and the 300s
+            # NCCL_CHECKPOINT_KVS_TIMEOUT never fires -- so the ranks did find each other
+            # through Redis. This is a deadlock re-establishing the SHM transport inside a
+            # restored gVisor sandbox, and NCCL has no timeout covering it. Only the
+            # wrapper's own RPC timeout eventually breaks it.
+            #
+            # NCCL_P2P_DISABLE is deliberately NOT set alongside it. Both were originally
+            # set together and both were assumed necessary; testing them separately showed
+            # P2P is fine. With P2P enabled and SHM disabled, all 8 ranks restore in under
+            # a second. That matters: P2P is direct GPU-to-GPU over PCIe (no NVLink on L4),
+            # which is the fastest intra-node path available here -- disabling it too would
+            # leave TCP-over-loopback for every collective.
+            - name: NCCL_SHM_DISABLE
+              value: "1"
+            # Must agree with the rendezvous-volume mountPath below.
             - name: NCCL_CHECKPOINT_KVS_PATH
               value: "/var/run/nccl/kvs.txt"
+            - name: NCCL_CHECKPOINT_KVS_ADDR
+              value: "127.0.0.1:6379"
+            # WARN is NCCL's default, set explicitly because it is load-bearing for
+            # debugging this guide: every shim failure so far surfaced as an NCCL
+            # WARN line and nothing else. VLLM_LOGGING_LEVEL does not enable NCCL's
+            # own logging, so a bad shim shows up as a bare "NCCL error: internal
+            # error" without it.
+            #
+            # To debug a checkpoint or restore failure, add:
+            #   NCCL_DEBUG=INFO
+            #   NCCL_DEBUG_SUBSYS=INIT,ENV,P2P,SHM
+            #   VLLM_LOGGING_LEVEL=DEBUG
+            # Expect tens of thousands of lines at TP=8 -- INFO logs per rank, per
+            # channel, per peer, and the torch watchdog polls ncclCommGetAsyncError
+            # in a loop. Filter that last one out or it drowns everything else.
+            - name: NCCL_DEBUG
+              value: "WARN"
+            # LD_PRELOAD and VLLM_NCCL_SO_PATH are intentionally NOT set here. They
+            # are baked into the image, which is the only place that knows the real
+            # libnccl path, and the ordering within LD_PRELOAD is load-bearing. See
+            # docker/Dockerfile.snapshot.
           resources:
             limits:
               cpu: "32"
@@ -63,3 +220,5 @@ spec:
                 path: providers.py
               - key: wrapper.py
                 path: vllm/wrapper.py
+              - key: worker.py
+                path: vllm/worker.py
