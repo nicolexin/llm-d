@@ -1,0 +1,46 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Qwen3-Coder-480B monitoring overlay.
+#
+# This is an overlay of the generic recipes/modelserver/components/monitoring-pd
+# component, which defines the decode and prefill PodMonitors on the
+# "modelserver" port. It covers both topologies: unified pods carry
+# llm-d.ai/role: decode (vLLM on 8000), and with TOPOLOGY=disaggregated the
+# prefill pods serve on 8000 and decode on 8200 behind the routing sidecar. In
+# the unified topology the prefill PodMonitor simply matches no pods. The patch
+# below only tightens the scrape interval to 5s, and the labels transformer
+# scopes the PodMonitors to this guide's pods (the labels must match
+# ../modelserver/tpu/vllm*/kustomization.yaml).
+components:
+  - ../../../recipes/modelserver/components/monitoring-pd
+
+labels:
+  - pairs:
+      llm-d.ai/guide: agentic-serving
+      llm-d.ai/model: Qwen3-Coder-480B-A35B-Instruct-FP8
+    includeSelectors: true
+    fields:
+      - group: monitoring.coreos.com
+        version: v1
+        kind: PodMonitor
+        path: metadata/labels
+        create: true
+      - group: monitoring.coreos.com
+        version: v1
+        kind: PodMonitor
+        path: spec/selector/matchLabels
+        create: true
+
+patches:
+  - target:
+      group: monitoring.coreos.com
+      version: v1
+      kind: PodMonitor
+    patch: |-
+      - op: replace
+        path: /spec/podMetricsEndpoints
+        value:
+          - port: modelserver
+            path: /metrics
+            interval: 5s

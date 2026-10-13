@@ -28,6 +28,11 @@ env:
     GUIDE_NAME: nemotron-3-ultra
     NAMESPACE: llm-d-nemotron-3-ultra
 
+    # Prometheus monitoring is opt-in: set MONITORING=true (requires the
+    # monitoring stack) to run the deploy.monitoring* steps.
+    MONITORING: {default: "false", values: ["false", "true"]}
+    MONITORING_VALUES: {default: ""}
+
     ACCELERATOR_TYPE: {default: gpu, values: [gpu]}
     MODEL_SERVER: {default: vllm, values: [vllm]}
     # gke: load the model from a GCS bucket (see modelserver/gpu/vllm/gke/README.md)
@@ -75,11 +80,16 @@ deploy:
         export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
         export ROUTER_VALUES="${REPO_ROOT}/guides/models/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml"
 
+  monitoring_values:
+    - when: {MONITORING: ["true"]}
+      run: export MONITORING_VALUES="-f ${REPO_ROOT}/guides/recipes/router/features/monitoring.values.yaml"
+
   standalone:
     - run: |
         helm install ${GUIDE_NAME} \
           ${ROUTER_STANDALONE_CHART} \
           -f ${ROUTER_BASE_VALUES} \
+          ${MONITORING_VALUES} \
           -f ${ROUTER_VALUES} \
           -n ${NAMESPACE} --version ${ROUTER_CHART_VERSION}
 
@@ -87,6 +97,11 @@ deploy:
     - run: |
         kubectl apply -n ${NAMESPACE} \
           -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/${INFRA_PROVIDER}/
+
+  monitoring:
+    # PodMonitors for the prefill and decode model servers (one API port per pod)
+    - when: {MONITORING: ["true"]}
+      run: kubectl apply -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/monitoring
 
 verify:
   endpoint:
@@ -119,5 +134,6 @@ cleanup:
     - run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/modelserver/${ACCELERATOR_TYPE}/${MODEL_SERVER}/${INFRA_PROVIDER}/
   rest:
     - run: helm uninstall ${GUIDE_NAME} -n ${NAMESPACE}
+    - run: kubectl delete -n ${NAMESPACE} -k ${REPO_ROOT}/guides/models/${GUIDE_NAME}/monitoring --ignore-not-found=true
     - skip_in: [ci]
       run: kubectl delete namespace ${NAMESPACE}
