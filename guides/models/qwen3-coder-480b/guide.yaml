@@ -48,6 +48,10 @@ prerequisites:
     - when: {TOPOLOGY: [disaggregated]}
       skip_in: [ci]
       run: |
+        # helm upgrade never updates CRDs, so apply the chart's CRDs first (see LWS
+        # "Upgrade by Helm"); this upgrades them on clusters that run an older LWS.
+        helm pull oci://registry.k8s.io/lws/charts/lws --version=0.11.1 --untar
+        kubectl apply --server-side --force-conflicts -f lws/crds
         helm upgrade --install lws oci://registry.k8s.io/lws/charts/lws \
           --version=0.11.1 \
           --namespace lws-system --create-namespace \
